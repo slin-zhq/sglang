@@ -36,6 +36,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,
 )
+from sglang.srt.speculative import eagle_topk_logger as _exp_logger
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -646,6 +647,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
             return batch_output
         else:
+            _t_cycle_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -655,11 +658,44 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
+
+            _t_draft_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            _t_draft_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
+
+            _t_verify_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
             batch_output = self.verify(model_worker_batch)
+            _t_verify_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
+            _t_extend_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            _t_extend_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
+            _t_cycle_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
+            # === INSTRUMENTATION: log per-cycle timings ===
+            if _exp_logger.ENABLED:
+                accept_lens = batch_output.accept_lens
+                if accept_lens is not None:
+                    accept_length_per_req = accept_lens.tolist()
+                else:
+                    accept_length_per_req = []
+                _cycle_idx = _exp_logger._cycle_counter  # snapshot before increment
+                _exp_logger.log_timing(
+                    cycle_idx=_cycle_idx,
+                    timings={
+                        "draft_s": _t_draft_end - _t_draft_start,
+                        "verify_s": _t_verify_end - _t_verify_start,
+                        "extend_s": _t_extend_end - _t_extend_start,
+                        "cycle_s": _t_cycle_end - _t_cycle_start,
+                    },
+                    accept_length_per_req=accept_length_per_req,
+                )
+            # === END INSTRUMENTATION ===
+
             return batch_output
 
     def verify(

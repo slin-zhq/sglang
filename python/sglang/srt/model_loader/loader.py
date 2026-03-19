@@ -260,6 +260,8 @@ def _initialize_model(
     quant_config: Optional[QuantizationConfig] = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
+    import inspect
+
     model_class, _ = get_model_architecture(model_config)
     kwargs = {
         "config": model_config.hf_config,
@@ -271,8 +273,14 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
+    # Only pass draft_model_idx to model classes whose __init__ explicitly
+    # accepts it (e.g. Step3p5MTP, MimoV2FlashNextN).  EAGLE3 draft models
+    # (e.g. LlamaForCausalLMEagle3) inherit from LlamaForCausalLM which does
+    # NOT accept this kwarg and would raise a TypeError.
     if load_config.draft_model_idx is not None:
-        kwargs["draft_model_idx"] = load_config.draft_model_idx
+        init_params = inspect.signature(model_class.__init__).parameters
+        if "draft_model_idx" in init_params:
+            kwargs["draft_model_idx"] = load_config.draft_model_idx
 
     return model_class(**kwargs)
 
