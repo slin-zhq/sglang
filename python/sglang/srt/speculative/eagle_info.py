@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
+from sglang.srt.speculative import eagle_topk_logger as _exp_logger
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -323,6 +324,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+
+            # === INSTRUMENTATION: log oracle acceptance data ===
+            if _exp_logger.ENABLED:
+                _exp_logger.log_verify_result(
+                    cycle_idx=_exp_logger._cycle_counter,
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    accept_index=accept_index,
+                    accept_length=accept_length,
+                    predict=predict,
+                )
+            # === END INSTRUMENTATION ===
 
         else:
             # apply temperature and get target probs

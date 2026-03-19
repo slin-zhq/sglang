@@ -233,7 +233,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
 
-    def mtp_model_runner(self, layer_id: int) -> ModelRunner:
+    def mtp_model_runner(self, layer_id: int) -> "ModelRunner":
         return self.model_runner_list[layer_id]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
