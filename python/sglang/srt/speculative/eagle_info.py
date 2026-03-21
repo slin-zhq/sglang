@@ -637,6 +637,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # Optional debug buffers for graph-safe experiment logging.
+    # When set, the captured draft forward writes into these tensors so the
+    # runner can log them after replay has returned to Python.
+    debug_score_list: Optional[torch.Tensor] = None
+    debug_top_scores_values: Optional[torch.Tensor] = None
+    debug_all_token_ids: Optional[torch.Tensor] = None
+
     # Inputs for extend
     # shape: (b,)
     verified_id: torch.Tensor = None

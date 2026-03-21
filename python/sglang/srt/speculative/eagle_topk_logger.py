@@ -47,6 +47,19 @@ _cycle_counter: int = 0          # global cycle index across all requests
 _open_files: Dict[str, object] = {}
 
 
+def _is_cuda_graph_capturing() -> bool:
+    """Return True when the current CUDA stream is inside graph capture."""
+    if not torch.cuda.is_available():
+        return False
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    try:
+        return bool(is_capturing())
+    except Exception:
+        return False
+
+
 # ──────────────────────────────────────────────
 # Timing helpers
 # ──────────────────────────────────────────────
@@ -114,7 +127,7 @@ def log_organize_draft_results(
     Called from eagle_utils.organize_draft_results() after torch.topk.
     Logs the full candidate pool and what topk selected.
     """
-    if not ENABLED:
+    if not ENABLED or _is_cuda_graph_capturing():
         return
 
     global _cycle_counter
@@ -155,7 +168,7 @@ def log_verify_result(
     Called from eagle_info.EagleVerifyInput.verify() after acceptance checking.
     Logs ground-truth acceptance data needed for Experiment 3 & 4.
     """
-    if not ENABLED:
+    if not ENABLED or _is_cuda_graph_capturing():
         return
 
     bs = candidates.shape[0]
@@ -189,7 +202,7 @@ def log_timing(
     Called from eagle_worker.forward_batch_generation() decode branch.
     Logs phase-level timings and per-request accept lengths for Experiment 1.
     """
-    if not ENABLED:
+    if not ENABLED or _is_cuda_graph_capturing():
         return
 
     record = {

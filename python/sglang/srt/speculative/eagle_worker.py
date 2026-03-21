@@ -726,6 +726,11 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
+        if getattr(spec_info, "debug_score_list", None) is not None:
+            spec_info.debug_score_list.copy_(score_list)
+            spec_info.debug_top_scores_values.copy_(top_scores.values)
+            spec_info.debug_all_token_ids.copy_(ss_token_list)
+
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
