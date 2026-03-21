@@ -176,7 +176,7 @@ def log_verify_result(
     target_cpu = target_predict.detach().cpu()
     acc_idx_cpu = accept_index.detach().cpu()
     acc_len_cpu = accept_length.detach().cpu()
-    predict_cpu = predict.detach().cpu()
+    predict_cpu = predict.detach().cpu().reshape(-1)
 
     for b in range(bs):
         acc_len = int(acc_len_cpu[b].item())
@@ -188,7 +188,9 @@ def log_verify_result(
             "candidates": candidates_cpu[b].tolist(),
             "target_model_argmax": target_cpu[b].tolist(),
             "accept_index": acc_idx_cpu[b].tolist(),
-            "accepted_tokens": predict_cpu[b, :acc_len].tolist() if acc_len > 0 else [],
+            "accepted_tokens": (
+                predict_cpu[acc_idx_cpu[b, :acc_len]].tolist() if acc_len > 0 else []
+            ),
         }
         _write_jsonl("verify_oracle.jsonl", record)
 
