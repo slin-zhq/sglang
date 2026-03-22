@@ -351,10 +351,14 @@ def log_timing(
 
     _refresh_log_path_from_control_file()
 
+    full_path = os.path.join(LOG_PATH, "timing.jsonl")
+    next_record_idx = _write_counters.get(full_path, 0)
+
     record = {
         **_base_record_fields(),
         "cycle_idx": cycle_idx,
         "event": "timing",
+        "cold_start": next_record_idx == 0,
         **timings,  # caller passes ms values directly
         "accept_length_per_req": accept_length_per_req,
         "mean_accept_length": (
@@ -362,7 +366,7 @@ def log_timing(
             if accept_length_per_req else 0.0
         ),
     }
-    _write_jsonl("cycle_data.jsonl", record)
+    _write_jsonl("timing.jsonl", record)
 
 
 def flush_all() -> None:
