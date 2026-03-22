@@ -3,8 +3,6 @@ from enum import IntEnum
 from typing import List, Optional
 
 import torch
-
-from sglang.srt.speculative import eagle_topk_logger as _exp_logger
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -28,17 +26,6 @@ def organize_draft_results(
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
-
-    # === INSTRUMENTATION: log full candidate pool + topk selection ===
-    if _exp_logger.ENABLED:
-        _exp_logger.log_organize_draft_results(
-            score_list_flat=score_list,
-            top_scores_indices=top_scores.indices,
-            top_scores_values=top_scores.values,
-            all_token_ids=ss_token_list,
-            num_draft_token=num_draft_token,
-        )
-    # === END INSTRUMENTATION ===
 
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 

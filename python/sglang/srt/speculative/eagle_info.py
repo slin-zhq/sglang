@@ -328,7 +328,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # === INSTRUMENTATION: log oracle acceptance data ===
             if _exp_logger.ENABLED:
                 _exp_logger.log_verify_result(
-                    cycle_idx=_exp_logger._cycle_counter,
                     candidates=candidates,
                     target_predict=target_predict,
                     accept_index=accept_index,

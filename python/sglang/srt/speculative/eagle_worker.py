@@ -313,6 +313,11 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            # === INSTRUMENTATION: begin_cycle() must be called first.
+            # It atomically increments the counter and sets _current_cycle_idx,
+            # which is then read by log_organize_draft_results (inside replay())
+            # and log_verify_result (inside verify()) for the same cycle. ===
+            _cycle_idx = _exp_logger.begin_cycle() if _exp_logger.ENABLED else 0
             _t_cycle_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
 
             with self.draft_tp_context(
@@ -348,14 +353,13 @@ class EAGLEWorker(TpModelWorker):
 
             # === INSTRUMENTATION: log per-cycle timings ===
             if _exp_logger.ENABLED:
-                _cycle_idx = _exp_logger._cycle_counter  # snapshot before next cycle
                 _exp_logger.log_timing(
                     cycle_idx=_cycle_idx,
                     timings={
-                        "draft_s": _t_draft_end - _t_draft_start,
-                        "verify_s": _t_verify_end - _t_verify_start,
-                        "extend_s": _t_extend_end - _t_extend_start,
-                        "cycle_s": _t_cycle_end - _t_cycle_start,
+                        "draft_ms": round((_t_draft_end - _t_draft_start) * 1000, 4),
+                        "verify_ms": round((_t_verify_end - _t_verify_start) * 1000, 4),
+                        "extend_ms": round((_t_extend_end - _t_extend_start) * 1000, 4),
+                        "cycle_ms": round((_t_cycle_end - _t_cycle_start) * 1000, 4),
                     },
                     accept_length_per_req=list(verify_output.accept_length_per_req_cpu),
                 )

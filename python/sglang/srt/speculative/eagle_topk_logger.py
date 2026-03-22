@@ -36,12 +36,15 @@ _DEFAULT_LOG_PATH = (
 
 ENABLED: bool = os.environ.get("EAGLE_TOPK_EXP_LOG_ENABLE", "1") == "1"
 LOG_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_PATH", _DEFAULT_LOG_PATH)
+CONTROL_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_CONTROL_PATH", "")
 
 # ──────────────────────────────────────────────
 # Thread-safe state
 # ──────────────────────────────────────────────
 _lock = threading.Lock()
-_cycle_counter: int = 0          # global cycle index across all requests
+_cycle_counter: int = 0          # global cycle index, incremented once per decode cycle
+_current_cycle_idx: int = 0      # idx for the in-flight cycle; shared by all log functions
+_control_mtime: Optional[float] = None
 
 # File handles keyed by their absolute path so we can reuse open handles
 _open_files: Dict[str, object] = {}
@@ -70,6 +73,61 @@ def _sync_and_time() -> float:
     return time.perf_counter()
 
 
+def _refresh_log_path_from_control_file() -> None:
+    """
+    Refresh LOG_PATH from a control file shared across processes.
+
+    This allows the benchmark parent process to switch turn directories while
+    scheduler child processes keep logging to the latest path.
+    """
+    global _control_mtime
+    if not CONTROL_PATH:
+        return
+
+    try:
+        mtime = os.path.getmtime(CONTROL_PATH)
+    except Exception:
+        return
+
+    if _control_mtime is not None and mtime <= _control_mtime:
+        return
+
+    try:
+        with open(CONTROL_PATH, "r") as f:
+            new_path = f.read().strip()
+    except Exception:
+        return
+
+    _control_mtime = mtime
+    if new_path and new_path != LOG_PATH:
+        set_log_path(new_path)
+
+
+# ──────────────────────────────────────────────
+# Cycle management
+# ──────────────────────────────────────────────
+def begin_cycle() -> int:
+    """
+    Mark the start of a new speculative-decoding decode cycle.
+
+    Atomically increments the global cycle counter and stores the snapshot
+    as _current_cycle_idx.  All three log functions (log_timing,
+    log_organize_draft_results, log_verify_result) read _current_cycle_idx
+    so every file written in the same cycle shares the same cycle_idx.
+
+    Call exactly once per decode cycle from
+    eagle_worker.EAGLEWorker.forward_batch_generation(), before draft().
+
+    Returns the cycle_idx for this cycle.
+    """
+    global _cycle_counter, _current_cycle_idx
+    with _lock:
+        idx = _cycle_counter
+        _cycle_counter += 1
+        _current_cycle_idx = idx
+    return idx
+
+
 # ──────────────────────────────────────────────
 # File helpers
 # ──────────────────────────────────────────────
@@ -78,7 +136,7 @@ def set_log_path(path: str) -> None:
     Update the log path at runtime (called by the benchmark script before each run).
     Also resets the cycle counter so per-run counters start from 0.
     """
-    global LOG_PATH, _cycle_counter, _open_files
+    global LOG_PATH, _cycle_counter, _current_cycle_idx, _open_files
     with _lock:
         # Close any open file handles from the previous run
         for fh in _open_files.values():
@@ -88,6 +146,7 @@ def set_log_path(path: str) -> None:
                 pass
         _open_files = {}
         _cycle_counter = 0
+        _current_cycle_idx = 0
         LOG_PATH = path
 
 
@@ -117,23 +176,26 @@ def _json_default(obj):
 # ──────────────────────────────────────────────
 
 def log_organize_draft_results(
-    score_list_flat: torch.Tensor,   # (bs, total_candidates) – all cum-log-probs
+    score_list_flat: torch.Tensor,    # (bs, total_candidates) – all cum-log-probs
     top_scores_indices: torch.Tensor, # (bs, num_draft_token-1) – selected indices
     top_scores_values: torch.Tensor,  # (bs, num_draft_token-1) – selected scores
-    all_token_ids: torch.Tensor,       # (bs, total_candidates) – all token IDs
+    all_token_ids: torch.Tensor,      # (bs, total_candidates) – all token IDs
     num_draft_token: int,
 ) -> None:
     """
-    Called from eagle_utils.organize_draft_results() after torch.topk.
+    Called from eagle_draft_cuda_graph_runner.replay() after the CUDA graph
+    replay returns, using the debug buffers written during graph execution.
     Logs the full candidate pool and what topk selected.
+
+    cycle_idx is read from _current_cycle_idx, which was set by begin_cycle()
+    at the top of the same decode cycle in eagle_worker.forward_batch_generation().
     """
     if not ENABLED or _is_cuda_graph_capturing():
         return
 
-    global _cycle_counter
-    with _lock:
-        cycle_idx = _cycle_counter
-        _cycle_counter += 1
+    _refresh_log_path_from_control_file()
+
+    cycle_idx = _current_cycle_idx
 
     bs = score_list_flat.shape[0]
     scores_cpu = score_list_flat.detach().cpu()
@@ -157,19 +219,25 @@ def log_organize_draft_results(
 
 
 def log_verify_result(
-    cycle_idx: int,
-    candidates: torch.Tensor,          # (bs, draft_token_num)
-    target_predict: torch.Tensor,       # (bs, draft_token_num)
-    accept_index: torch.Tensor,         # (bs, spec_steps+1)
-    accept_length: torch.Tensor,        # (bs,)
-    predict: torch.Tensor,              # accepted token IDs
+    candidates: torch.Tensor,     # (bs, draft_token_num)
+    target_predict: torch.Tensor, # (bs, draft_token_num)
+    accept_index: torch.Tensor,   # (bs, spec_steps+1)
+    accept_length: torch.Tensor,  # (bs,)
+    predict: torch.Tensor,        # accepted token IDs
 ) -> None:
     """
     Called from eagle_info.EagleVerifyInput.verify() after acceptance checking.
     Logs ground-truth acceptance data needed for Experiment 3 & 4.
+
+    cycle_idx is read from _current_cycle_idx, which was set by begin_cycle()
+    at the top of the same decode cycle in eagle_worker.forward_batch_generation().
     """
     if not ENABLED or _is_cuda_graph_capturing():
         return
+
+    _refresh_log_path_from_control_file()
+
+    cycle_idx = _current_cycle_idx
 
     bs = candidates.shape[0]
     candidates_cpu = candidates.detach().cpu()
@@ -203,21 +271,26 @@ def log_timing(
     """
     Called from eagle_worker.forward_batch_generation() decode branch.
     Logs phase-level timings and per-request accept lengths for Experiment 1.
+
+    `timings` must have keys draft_ms, verify_ms, extend_ms, cycle_ms with
+    values already in milliseconds (caller is responsible for the conversion).
     """
     if not ENABLED or _is_cuda_graph_capturing():
         return
 
+    _refresh_log_path_from_control_file()
+
     record = {
         "cycle_idx": cycle_idx,
         "event": "timing",
-        **{k: round(v * 1000, 4) for k, v in timings.items()},  # convert s → ms
+        **timings,  # caller passes ms values directly
         "accept_length_per_req": accept_length_per_req,
         "mean_accept_length": (
             sum(accept_length_per_req) / len(accept_length_per_req)
             if accept_length_per_req else 0.0
         ),
     }
-    _write_jsonl("cycle_timings.jsonl", record)
+    _write_jsonl("cycle_data.jsonl", record)
 
 
 def flush_all() -> None:
