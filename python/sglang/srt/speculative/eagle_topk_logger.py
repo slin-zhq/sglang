@@ -16,6 +16,11 @@ Logging granularity
 ───────────────────
 One JSONL line = one speculative-decoding cycle for one request in the batch.
 Fields are documented in experiment_plan.md Section 7.
+
+Each record also carries the benchmark context:
+    bench_name, rep_idx, question_id, turn_id
+
+These fields are injected by the benchmark harness before each generate() call.
 """
 
 import json
@@ -44,6 +49,12 @@ CONTROL_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_CONTROL_PATH", "")
 _lock = threading.Lock()
 _cycle_counter: int = 0          # global cycle index, incremented once per decode cycle
 _current_cycle_idx: int = 0      # idx for the in-flight cycle; shared by all log functions
+_record_context = {
+    "bench_name": "",
+    "rep_idx": -1,
+    "question_id": -1,
+    "turn_id": -1,
+}
 _control_mtime: Optional[float] = None
 
 # File handles keyed by their absolute path so we can reuse open handles
@@ -150,6 +161,28 @@ def set_log_path(path: str) -> None:
         LOG_PATH = path
 
 
+def set_record_context(
+    bench_name: str,
+    rep_idx: int,
+    question_id: int,
+    turn_id: int,
+) -> None:
+    """Set the benchmark identity fields that are embedded into each JSONL row."""
+    global _record_context
+    with _lock:
+        _record_context = {
+            "bench_name": bench_name,
+            "rep_idx": int(rep_idx),
+            "question_id": int(question_id),
+            "turn_id": int(turn_id),
+        }
+
+
+def _base_record_fields() -> dict:
+    """Return the shared identity fields for the current logging context."""
+    return dict(_record_context)
+
+
 def _get_file_handle(filename: str):
     """Return (and cache) an open file handle for `filename` inside LOG_PATH."""
     full_path = os.path.join(LOG_PATH, filename)
@@ -205,6 +238,7 @@ def log_organize_draft_results(
 
     for b in range(bs):
         record = {
+            **_base_record_fields(),
             "cycle_idx": cycle_idx,
             "batch_elem": b,
             "event": "organize_draft_results",
@@ -249,6 +283,7 @@ def log_verify_result(
     for b in range(bs):
         acc_len = int(acc_len_cpu[b].item())
         record = {
+            **_base_record_fields(),
             "cycle_idx": cycle_idx,
             "batch_elem": b,
             "event": "verify",
@@ -281,6 +316,7 @@ def log_timing(
     _refresh_log_path_from_control_file()
 
     record = {
+        **_base_record_fields(),
         "cycle_idx": cycle_idx,
         "event": "timing",
         **timings,  # caller passes ms values directly
