@@ -56,6 +56,7 @@ _record_context = {
     "turn_id": -1,
 }
 _control_mtime: Optional[float] = None
+_write_counters: Dict[str, int] = {}
 
 # File handles keyed by their absolute path so we can reuse open handles
 _open_files: Dict[str, object] = {}
@@ -105,13 +106,42 @@ def _refresh_log_path_from_control_file() -> None:
 
     try:
         with open(CONTROL_PATH, "r") as f:
-            new_path = f.read().strip()
+            control_payload = f.read().strip()
     except Exception:
         return
 
     _control_mtime = mtime
+    if not control_payload:
+        return
+
+    new_path = control_payload
+    new_context = None
+
+    if control_payload.startswith("{"):
+        try:
+            payload = json.loads(control_payload)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            new_path = str(payload.get("log_path", "")).strip()
+            if new_path:
+                new_context = {
+                    "bench_name": str(payload.get("bench_name", "")),
+                    "rep_idx": int(payload.get("rep_idx", -1)),
+                    "question_id": int(payload.get("question_id", -1)),
+                    "turn_id": int(payload.get("turn_id", -1)),
+                }
+
     if new_path and new_path != LOG_PATH:
         set_log_path(new_path)
+
+    if new_context is not None:
+        set_record_context(
+            new_context["bench_name"],
+            new_context["rep_idx"],
+            new_context["question_id"],
+            new_context["turn_id"],
+        )
 
 
 # ──────────────────────────────────────────────
@@ -147,7 +177,7 @@ def set_log_path(path: str) -> None:
     Update the log path at runtime (called by the benchmark script before each run).
     Also resets the cycle counter so per-run counters start from 0.
     """
-    global LOG_PATH, _cycle_counter, _current_cycle_idx, _open_files
+    global LOG_PATH, _cycle_counter, _current_cycle_idx, _write_counters, _open_files
     with _lock:
         # Close any open file handles from the previous run
         for fh in _open_files.values():
@@ -156,6 +186,7 @@ def set_log_path(path: str) -> None:
             except Exception:
                 pass
         _open_files = {}
+        _write_counters = {}
         _cycle_counter = 0
         _current_cycle_idx = 0
         LOG_PATH = path
@@ -193,8 +224,13 @@ def _get_file_handle(filename: str):
 
 
 def _write_jsonl(filename: str, record: dict) -> None:
-    fh = _get_file_handle(filename)
-    fh.write(json.dumps(record, default=_json_default) + "\n")
+    full_path = os.path.join(LOG_PATH, filename)
+    with _lock:
+        record_to_write = dict(record)
+        record_to_write["record_idx"] = _write_counters.get(full_path, 0)
+        _write_counters[full_path] = record_to_write["record_idx"] + 1
+        fh = _get_file_handle(filename)
+        fh.write(json.dumps(record_to_write, default=_json_default) + "\n")
 
 
 def _json_default(obj):
