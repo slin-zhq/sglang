@@ -407,9 +407,15 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+        _t_prefill_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        if _exp_logger.ENABLED:
+            _t_prefill_end = _exp_logger._sync_and_time()
+            _exp_logger.log_prefill_timing(
+                prefill_ms=(_t_prefill_end - _t_prefill_start) * 1000.0
+            )
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -420,6 +426,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
+
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()

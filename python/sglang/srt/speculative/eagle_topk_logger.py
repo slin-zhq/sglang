@@ -57,6 +57,8 @@ _record_context = {
 }
 _control_mtime: Optional[float] = None
 _write_counters: Dict[str, int] = {}
+_decode_counters: Dict[str, int] = {}  # counts log_timing calls per timing.jsonl path
+
 
 # File handles keyed by their absolute path so we can reuse open handles
 _open_files: Dict[str, object] = {}
@@ -177,7 +179,7 @@ def set_log_path(path: str) -> None:
     Update the log path at runtime (called by the benchmark script before each run).
     Also resets the cycle counter so per-run counters start from 0.
     """
-    global LOG_PATH, _cycle_counter, _current_cycle_idx, _write_counters, _open_files
+    global LOG_PATH, _cycle_counter, _current_cycle_idx, _write_counters, _decode_counters, _open_files
     with _lock:
         # Close any open file handles from the previous run
         for fh in _open_files.values():
@@ -187,6 +189,7 @@ def set_log_path(path: str) -> None:
                 pass
         _open_files = {}
         _write_counters = {}
+        _decode_counters = {}
         _cycle_counter = 0
         _current_cycle_idx = 0
         LOG_PATH = path
@@ -334,6 +337,31 @@ def log_verify_result(
         _write_jsonl("verify_oracle.jsonl", record)
 
 
+def log_prefill_timing(prefill_ms: float) -> None:
+    """
+    Called from eagle_worker.forward_target_extend() to record the duration of
+    the first-cycle target-model extend (prefill) pass.
+
+    Writes one row to timing.jsonl with event="prefill".  This is always the
+    very first row in the file (record_idx=0 / cold_start=True) and is written
+    before any decode-cycle rows.  Callers that only want steady-state timing
+    should filter on event=="timing" (not "prefill").
+    """
+    if not ENABLED or _is_cuda_graph_capturing():
+        return
+
+    _refresh_log_path_from_control_file()
+
+    record = {
+        **_base_record_fields(),
+        "cycle_idx": -1,   # not a decode cycle
+        "event": "prefill",
+        "cold_start": True,
+        "prefill_ms": round(prefill_ms, 4),
+    }
+    _write_jsonl("timing.jsonl", record)
+
+
 def log_timing(
     cycle_idx: int,
     timings: dict,
@@ -345,6 +373,9 @@ def log_timing(
 
     `timings` must have keys draft_ms, verify_ms, extend_ms, cycle_ms with
     values already in milliseconds (caller is responsible for the conversion).
+
+    Sets cold_start=True on the first call per turn (tracked via
+    _decode_counters) regardless of any prefill row that may precede it.
     """
     if not ENABLED or _is_cuda_graph_capturing():
         return
@@ -352,13 +383,24 @@ def log_timing(
     _refresh_log_path_from_control_file()
 
     full_path = os.path.join(LOG_PATH, "timing.jsonl")
-    next_record_idx = _write_counters.get(full_path, 0)
+    # cold_start is True for the first *decode* row in each turn.
+    # _decode_counters tracks how many log_timing() calls have been made for
+    # this path, independently of _write_counters (which also counts the
+    # leading prefill row emitted by log_prefill_timing()).  This ensures
+    # cold_start=True on the first decode row regardless of whether a prefill
+    # row was written first.
+    # NOTE: We acquire-then-release the lock *before* calling _write_jsonl,
+    # which also acquires the same (non-reentrant) lock.  Holding the lock
+    # across _write_jsonl would deadlock.
+    with _lock:
+        decode_idx = _decode_counters.get(full_path, 0)
+        _decode_counters[full_path] = decode_idx + 1
 
     record = {
         **_base_record_fields(),
         "cycle_idx": cycle_idx,
         "event": "timing",
-        "cold_start": next_record_idx == 0,
+        "cold_start": decode_idx == 0,
         **timings,  # caller passes ms values directly
         "accept_length_per_req": accept_length_per_req,
         "mean_accept_length": (
