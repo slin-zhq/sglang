@@ -5,8 +5,8 @@ Per-cycle data logger for the torch.topk optimisation experiment.
 
 Two environment variables control behaviour:
   EAGLE_TOPK_EXP_LOG_ENABLE  - "1" to enable (default: "1")
-  EAGLE_TOPK_EXP_LOG_PATH    - absolute directory where JSONL files are written.
-                                The benchmark script sets this per config/dataset/rep/turn.
+    EAGLE_TOPK_EXP_LOG_PATH    - absolute directory where JSONL files are written.
+                                                                The benchmark script sets this per config/dataset/rep/turn.
                                 Default: /mnt/zhiqi/sglang_eagle3_optimize/outputs/torch_topk_optimization
 
 When disabled (EAGLE_TOPK_EXP_LOG_ENABLE != "1"), every function in this module
@@ -334,7 +334,7 @@ def log_verify_result(
                 predict_cpu[acc_idx_cpu[b, :acc_len]].tolist() if acc_len > 0 else []
             ),
         }
-        _write_jsonl("verify_oracle.jsonl", record)
+        _write_jsonl("verify.jsonl", record)
 
 
 def log_prefill_timing(prefill_ms: float) -> None:
@@ -365,11 +365,10 @@ def log_prefill_timing(prefill_ms: float) -> None:
 def log_timing(
     cycle_idx: int,
     timings: dict,
-    accept_length_per_req: List[int],
 ) -> None:
     """
     Called from eagle_worker.forward_batch_generation() decode branch.
-    Logs phase-level timings and per-request accept lengths for Experiment 1.
+    Logs phase-level timings for Experiment 1.
 
     `timings` must have keys draft_ms, verify_ms, extend_ms, cycle_ms with
     values already in milliseconds (caller is responsible for the conversion).
@@ -402,11 +401,6 @@ def log_timing(
         "event": "timing",
         "cold_start": decode_idx == 0,
         **timings,  # caller passes ms values directly
-        "accept_length_per_req": accept_length_per_req,
-        "mean_accept_length": (
-            sum(accept_length_per_req) / len(accept_length_per_req)
-            if accept_length_per_req else 0.0
-        ),
     }
     _write_jsonl("timing.jsonl", record)
 

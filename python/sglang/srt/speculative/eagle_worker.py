@@ -361,7 +361,6 @@ class EAGLEWorker(TpModelWorker):
                         "extend_ms": round((_t_extend_end - _t_extend_start) * 1000, 4),
                         "cycle_ms": round((_t_cycle_end - _t_cycle_start) * 1000, 4),
                     },
-                    accept_length_per_req=list(verify_output.accept_length_per_req_cpu),
                 )
             # === END INSTRUMENTATION ===
 
