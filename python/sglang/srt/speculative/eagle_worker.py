@@ -327,6 +327,18 @@ class EAGLEWorker(TpModelWorker):
                 spec_info = self.draft(batch)
                 _t_draft_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
 
+            # Capture per-request prefix length (context KV tokens already
+            # cached) immediately before the verify forward. Needed to control
+            # for prefix growth when studying FA2 CTA_TILE_Q tile boundaries.
+            # See docs/budget_vs_verify_time/verify_flashinfer_ctaTileQ.md §5.1.1.
+            if _exp_logger.ENABLED:
+                try:
+                    _prefix_lens = batch.seq_lens.tolist()
+                except Exception:
+                    _prefix_lens = None
+            else:
+                _prefix_lens = None
+
             _t_verify_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
@@ -360,6 +372,7 @@ class EAGLEWorker(TpModelWorker):
                         "verify_ms": round((_t_verify_end - _t_verify_start) * 1000, 4),
                         "extend_ms": round((_t_extend_end - _t_extend_start) * 1000, 4),
                         "cycle_ms": round((_t_cycle_end - _t_cycle_start) * 1000, 4),
+                        "prefix_lens": _prefix_lens,
                     },
                 )
             # === END INSTRUMENTATION ===

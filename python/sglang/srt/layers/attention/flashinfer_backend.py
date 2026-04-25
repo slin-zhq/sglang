@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative import eagle_topk_logger as _exp_logger
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -777,6 +778,22 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
+            # === INSTRUMENTATION: per-layer attention time for TARGET_VERIFY ===
+            # Gated on EAGLE_ATTN_MS_LOG_ENABLE=1 (via collect_data.py --log-attn-ms).
+            # Skipped during CUDA graph capture because event objects captured into
+            # the graph record the same handle on every replay, making per-replay
+            # timing unreliable. See verify_flashinfer_ctaTileQ.md §5.2.1.
+            _attn_instrument = (
+                _exp_logger.ENABLED
+                and _exp_logger.ATTN_MS_ENABLED
+                and forward_batch.forward_mode.is_target_verify()
+                and not _exp_logger._is_cuda_graph_capturing()
+            )
+            if _attn_instrument:
+                _evt_start = torch.cuda.Event(enable_timing=True)
+                _evt_end = torch.cuda.Event(enable_timing=True)
+                _evt_start.record()
+
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -801,6 +818,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+
+            if _attn_instrument:
+                _evt_end.record()
+                _exp_logger.accumulate_attn_event(_evt_start, _evt_end)
+            # === END INSTRUMENTATION ===
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `forward_batch.token_to_kv_pool` for this layer. This enables attention over

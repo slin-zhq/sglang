@@ -3,13 +3,18 @@ eagle_topk_logger.py
 ────────────────────
 Per-cycle data logger for the torch.topk optimisation experiment.
 
-Two environment variables control behaviour:
-  EAGLE_TOPK_EXP_LOG_ENABLE  - "1" to enable (default: "1")
-    EAGLE_TOPK_EXP_LOG_PATH    - absolute directory where JSONL files are written.
-                                                                The benchmark script sets this per config/dataset/rep/turn.
-                                Default: /mnt/zhiqi/sglang_eagle3_optimize/outputs/torch_topk_optimization
+Environment variables controlling behaviour:
+  EAGLE_TOPK_EXP_LOG_ENABLE    - "1" to enable all logging (default: "1")
+  EAGLE_TOPK_EXP_LOG_PATH      - absolute directory where JSONL files are written.
+                                 The benchmark script sets this per config/dataset/rep/turn.
+                                 Default: /mnt/zhiqi/sglang_eagle3_optimize/outputs/torch_topk_optimization
+  EAGLE_ATTN_MS_LOG_ENABLE     - "1" to additionally instrument the FlashInfer
+                                 TARGET_VERIFY attention call with torch.cuda.Event
+                                 and emit `attn_ms` in timing.jsonl. Default: "0".
+                                 Subordinate to EAGLE_TOPK_EXP_LOG_ENABLE — if that
+                                 is 0, attn_ms logging is also disabled.
 
-When disabled (EAGLE_TOPK_EXP_LOG_ENABLE != "1"), every function in this module
+When EAGLE_TOPK_EXP_LOG_ENABLE != "1", every function in this module
 returns immediately with zero overhead.
 
 Logging granularity
@@ -40,6 +45,7 @@ _DEFAULT_LOG_PATH = (
 )
 
 ENABLED: bool = os.environ.get("EAGLE_TOPK_EXP_LOG_ENABLE", "1") == "1"
+ATTN_MS_ENABLED: bool = os.environ.get("EAGLE_ATTN_MS_LOG_ENABLE", "0") == "1"
 LOG_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_PATH", _DEFAULT_LOG_PATH)
 CONTROL_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_CONTROL_PATH", "")
 
@@ -62,6 +68,50 @@ _decode_counters: Dict[str, int] = {}  # counts log_timing calls per timing.json
 
 # File handles keyed by their absolute path so we can reuse open handles
 _open_files: Dict[str, object] = {}
+
+# Pending (start_event, end_event) pairs from the TARGET_VERIFY attention path.
+# Drained once per cycle in log_timing() when ATTN_MS_ENABLED.
+_pending_attn_events: List[tuple] = []
+
+
+def accumulate_attn_event(evt_start, evt_end) -> None:
+    """
+    Record a (start, end) CUDA event pair from one TARGET_VERIFY attention call.
+
+    Called from FlashInferAttnBackend.forward_extend around the
+    prefill_wrapper_paged.forward invocation, once per transformer layer per
+    decode cycle (32 calls per cycle for Llama 3.1 8B).
+
+    Both events must have been .record()-ed on the current CUDA stream before
+    this function returns. No GPU sync happens here — sync is deferred to
+    _drain_attn_events_ms() called from log_timing().
+
+    When ATTN_MS_ENABLED is False, callers skip the wrap entirely; this
+    function is never invoked.
+    """
+    if not (ENABLED and ATTN_MS_ENABLED):
+        return
+    _pending_attn_events.append((evt_start, evt_end))
+
+
+def _drain_attn_events_ms() -> float:
+    """
+    Sum the elapsed time across all pending (start, end) event pairs, in ms.
+
+    Assumes the caller has already called torch.cuda.synchronize() (log_timing
+    does so via _sync_and_time()). Clears the pending list after reading.
+    """
+    if not _pending_attn_events:
+        return 0.0
+    total_ms = 0.0
+    for s, e in _pending_attn_events:
+        try:
+            total_ms += s.elapsed_time(e)
+        except Exception:
+            # Event not yet recorded (e.g., raced), skip rather than crash.
+            continue
+    _pending_attn_events.clear()
+    return total_ms
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -402,6 +452,13 @@ def log_timing(
         "cold_start": decode_idx == 0,
         **timings,  # caller passes ms values directly
     }
+
+    # Drain TARGET_VERIFY attention events accumulated during this cycle.
+    # _sync_and_time() at the end of the verify phase has already called
+    # torch.cuda.synchronize(), so elapsed_time() is safe here.
+    if ATTN_MS_ENABLED:
+        record["attn_ms"] = round(_drain_attn_events_ms(), 4)
+
     _write_jsonl("timing.jsonl", record)
 
 
