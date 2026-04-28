@@ -305,8 +305,12 @@ def log_organize_draft_results(
     num_draft_token: int,
 ) -> None:
     """
-    Called from eagle_draft_cuda_graph_runner.replay() after the CUDA graph
-    replay returns, using the debug buffers written during graph execution.
+    Called from two sites:
+      1. ``eagle_draft_cuda_graph_runner.replay()`` — CUDA-graph path, reads from
+         pre-allocated debug buffers written during graph execution.
+      2. ``eagle_worker.EAGLEWorker.draft_forward()`` — eager path (``--disable-cuda-graph``),
+         reads directly from the local tensors already computed in that function.
+
     Logs the full candidate pool and what topk selected.
 
     cycle_idx is read from _current_cycle_idx, which was set by begin_cycle()

@@ -770,6 +770,21 @@ class EAGLEWorker(TpModelWorker):
             spec_info.debug_top_scores_values.copy_(top_scores.values)
             spec_info.debug_all_token_ids.copy_(ss_token_list)
 
+        # === INSTRUMENTATION: log draft pool in eager (no-CUDA-graph) path ===
+        # This mirrors the log_organize_draft_results() call in
+        # EAGLEDraftCudaGraphRunner.replay() for runs with --disable-cuda-graph.
+        # We read directly from local tensors rather than the debug_score_list
+        # buffers (those are graph-capture-time allocations and may be None here).
+        if _exp_logger.ENABLED:
+            _exp_logger.log_organize_draft_results(
+                score_list_flat=score_list_flat,
+                top_scores_indices=top_scores_index,
+                top_scores_values=top_scores.values,
+                all_token_ids=ss_token_list,
+                num_draft_token=self.speculative_num_draft_tokens,
+            )
+        # === END INSTRUMENTATION ===
+
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
