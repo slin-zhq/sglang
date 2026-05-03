@@ -327,12 +327,50 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             # === INSTRUMENTATION: log oracle acceptance data ===
             if _exp_logger.ENABLED:
+                # Optionally extract target model log-probs at accepted positions.
+                # logits_output.next_token_logits shape: (bs * draft_token_num, vocab_size).
+                # Row b*T + p contains the target's distribution predicting the token
+                # at candidate position p for batch element b.
+                t_accept_lp = None
+                t_top5_tok = None
+                t_top5_lp = None
+                if _exp_logger.TARGET_LOGITS_ENABLED:
+                    import torch as _torch
+                    _topk_n = _exp_logger.TARGET_LOGITS_TOPK
+                    T = self.draft_token_num
+                    logits = logits_output.next_token_logits  # (bs*T, vocab)
+                    log_probs = _torch.log_softmax(logits.float(), dim=-1)
+                    ai_cpu = accept_index.detach().cpu()
+                    al_cpu = accept_length.detach().cpu()
+                    t_accept_lp = []
+                    t_topn_tok = []
+                    t_topn_lp = []
+                    for b in range(bs):
+                        acc_len = int(al_cpu[b].item())
+                        b_lp, b_tnt, b_tnlp = [], [], []
+                        for d in range(1, acc_len + 1):
+                            idx = int(ai_cpu[b, d].item())  # 1-based into candidates
+                            if idx <= 0:
+                                break
+                            pos = b * T + (idx - 1)  # row in logit matrix
+                            tok_id = int(candidates[b, idx - 1].item())
+                            b_lp.append(round(float(log_probs[pos, tok_id].item()), 6))
+                            topn_lp_vals, topn_tok_vals = _torch.topk(log_probs[pos], _topk_n)
+                            b_tnt.append(topn_tok_vals.tolist())
+                            b_tnlp.append([round(v, 6) for v in topn_lp_vals.tolist()])
+                        t_accept_lp.append(b_lp)
+                        t_topn_tok.append(b_tnt)
+                        t_topn_lp.append(b_tnlp)
+
                 _exp_logger.log_verify_result(
                     candidates=candidates,
                     target_predict=target_predict,
                     accept_index=accept_index,
                     accept_length=accept_length,
                     predict=predict,
+                    target_accept_log_probs=t_accept_lp,
+                    target_topn_tokens=t_topn_tok,
+                    target_topn_log_probs=t_topn_lp,
                 )
             # === END INSTRUMENTATION ===
 

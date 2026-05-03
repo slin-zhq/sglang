@@ -38,6 +38,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative.eagle_utils import compute_depth_budget_vector, _depth_aware_topk_indices
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -96,6 +97,20 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        # Depth-aware budget allocation: computed once from config, reused every cycle.
+        # None means use original global topK (baseline).
+        self.depth_budget = compute_depth_budget_vector(
+            depth=self.speculative_num_steps,
+            k=self.topk,
+            candidate_budget=self.speculative_num_draft_tokens - 1,
+            technique=server_args.speculative_budget_allocation,
+        )
+        if self.depth_budget is not None:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                f"Depth-aware budget allocation: technique={server_args.speculative_budget_allocation!r}  "
+                f"b_per_depth={self.depth_budget}  sum={sum(self.depth_budget)}"
+            )
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -747,10 +762,21 @@ class EAGLEWorker(TpModelWorker):
 
         score_list_flat = torch.cat(score_list, dim=1).flatten(1)
         ss_token_list = torch.cat(token_list, dim=1)
-        top_scores = torch.topk(
-            score_list_flat, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = torch.sort(top_scores.indices).values
+        if self.depth_budget is not None:
+            # Depth-aware per-depth topK: replaces global topK with per-depth selection.
+            # Requires --disable-cuda-graph (Python-level loop, not graph-capturable).
+            top_scores_index = _depth_aware_topk_indices(
+                score_list_flat, self.depth_budget, self.topk, self.speculative_num_steps
+            )
+            # Scores at selected (index-sorted) positions, needed by logger.
+            top_scores_values = score_list_flat.gather(1, top_scores_index)
+        else:
+            top_scores = torch.topk(
+                score_list_flat, self.speculative_num_draft_tokens - 1, dim=-1
+            )
+            top_scores_index = torch.sort(top_scores.indices).values
+            # Re-gather scores in index-sorted order to match the logger's expectation.
+            top_scores_values = score_list_flat.gather(1, top_scores_index)
         maybe_detect_oob(
             top_scores_index,
             0,
@@ -779,7 +805,7 @@ class EAGLEWorker(TpModelWorker):
             _exp_logger.log_organize_draft_results(
                 score_list_flat=score_list_flat,
                 top_scores_indices=top_scores_index,
-                top_scores_values=top_scores.values,
+                top_scores_values=top_scores_values,
                 all_token_ids=ss_token_list,
                 num_draft_token=self.speculative_num_draft_tokens,
             )

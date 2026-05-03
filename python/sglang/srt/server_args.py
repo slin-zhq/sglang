@@ -492,6 +492,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_budget_allocation: str = "baseline"
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
@@ -4584,6 +4585,19 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-budget-allocation",
+            type=str,
+            choices=["baseline", "keep_shallow_full", "uniform_capped", "oracle_accept_prior"],
+            help=(
+                "Per-depth budget allocation strategy for EAGLE3 draft token selection. "
+                "'baseline' (default) uses the original global torch.topk. "
+                "'keep_shallow_full' fills shallow depths completely and distributes "
+                "the remainder evenly across deeper depths (empirically near-optimal). "
+                "Non-baseline techniques require --disable-cuda-graph."
+            ),
+            default=ServerArgs.speculative_budget_allocation,
         )
         parser.add_argument(
             "--speculative-attention-mode",

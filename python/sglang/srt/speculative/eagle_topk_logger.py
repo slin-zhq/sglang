@@ -13,6 +13,13 @@ Environment variables controlling behaviour:
                                  and emit `attn_ms` in timing.jsonl. Default: "0".
                                  Subordinate to EAGLE_TOPK_EXP_LOG_ENABLE — if that
                                  is 0, attn_ms logging is also disabled.
+  EAGLE_TARGET_LOGITS_LOG_ENABLE - "1" to log target model log-probs and top-N
+                                 token distributions at accepted positions in
+                                 verify.jsonl. Default: "1" (on by default).
+                                 Adds ~1-5%% overhead per cycle due to log-softmax
+                                 on the full vocab.  Pass "0" to suppress.
+  EAGLE_TARGET_LOGITS_TOPK     - How many top tokens to log per accepted depth
+                                 position (default: 5).  Must be a positive integer.
 
 When EAGLE_TOPK_EXP_LOG_ENABLE != "1", every function in this module
 returns immediately with zero overhead.
@@ -46,6 +53,14 @@ _DEFAULT_LOG_PATH = (
 
 ENABLED: bool = os.environ.get("EAGLE_TOPK_EXP_LOG_ENABLE", "1") == "1"
 ATTN_MS_ENABLED: bool = os.environ.get("EAGLE_ATTN_MS_LOG_ENABLE", "0") == "1"
+# When True, log_verify_result() also writes target model log-probs of accepted tokens
+# and top-N token distributions at each accepted depth.  Opt-in via collect_data.py
+# --log-target-logits flag (sets EAGLE_TARGET_LOGITS_LOG_ENABLE=1).
+# On by default — pass --no-log-target-logits or set env var to "0" to suppress.
+TARGET_LOGITS_ENABLED: bool = os.environ.get("EAGLE_TARGET_LOGITS_LOG_ENABLE", "1") == "1"
+# Number of top tokens to log per accepted depth position.  Controlled by
+# --log-target-logits-topk in collect_data.py (sets EAGLE_TARGET_LOGITS_TOPK).
+TARGET_LOGITS_TOPK: int = int(os.environ.get("EAGLE_TARGET_LOGITS_TOPK", "5"))
 LOG_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_PATH", _DEFAULT_LOG_PATH)
 CONTROL_PATH: str = os.environ.get("EAGLE_TOPK_EXP_LOG_CONTROL_PATH", "")
 
@@ -351,6 +366,11 @@ def log_verify_result(
     accept_index: torch.Tensor,   # (bs, spec_steps+1)
     accept_length: torch.Tensor,  # (bs,)
     predict: torch.Tensor,        # accepted token IDs
+    # Optional target-logit fields (populated when TARGET_LOGITS_ENABLED).
+    # Per batch-element, per accepted-depth lists (outer=batch, inner=depth).
+    target_accept_log_probs=None,   # list[list[float]]
+    target_topn_tokens=None,        # list[list[list[int]]]   (bs, depth, N)
+    target_topn_log_probs=None,     # list[list[list[float]]] (bs, depth, N)
 ) -> None:
     """
     Called from eagle_info.EagleVerifyInput.verify() after acceptance checking.
@@ -388,6 +408,15 @@ def log_verify_result(
                 predict_cpu[acc_idx_cpu[b, :acc_len]].tolist() if acc_len > 0 else []
             ),
         }
+        # Optional target logit fields (written only when TARGET_LOGITS_ENABLED).
+        # Field names include the actual topk count N and a _per_depth suffix so
+        # readers know the inner lists are indexed by accepted depth position.
+        if target_accept_log_probs is not None and b < len(target_accept_log_probs):
+            record["target_accept_log_probs"] = target_accept_log_probs[b]
+        if target_topn_tokens is not None and b < len(target_topn_tokens):
+            record["target_topN_tokens_per_depth"] = target_topn_tokens[b]
+        if target_topn_log_probs is not None and b < len(target_topn_log_probs):
+            record["target_topN_log_probs_per_depth"] = target_topn_log_probs[b]
         _write_jsonl("verify.jsonl", record)
 
 
