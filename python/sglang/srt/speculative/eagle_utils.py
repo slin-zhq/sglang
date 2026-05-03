@@ -130,6 +130,17 @@ def compute_depth_budget_vector(
             deficit += cut
         d -= 1
 
+    # Closure sanitization: every depth d where depth d+1 has budget must have
+    # b[d] >= k so that all k generative parents (locals 0..k-1) can be forced.
+    # If b[d] < k and b[d+1] > 0, redistribute deeper-depth budget upward and
+    # truncate — scanning deepest-to-shallowest so each fix is self-consistent.
+    for d in range(depth - 2, -1, -1):
+        if b[d + 1] > 0 and b[d] < k:
+            freed = sum(b[d + 1 :])
+            for d2 in range(d + 1, depth):
+                b[d2] = 0
+            b[d] = min(pools[d], b[d] + freed)
+
     return b
 
 
@@ -180,9 +191,11 @@ def _depth_aware_topk_indices(
     ─────────────────
     The tree kernel (build_tree_efficient in eagle_utils.cu) requires every
     selected depth-d node's parent at depth d-1 to also be in top_scores_index.
-    A score-only per-depth topK does NOT guarantee this. We add a second pass
-    (Step 2) that promotes every selected node's parent to +inf in the masked
-    tensor, ensuring parents survive the final topk regardless of their score.
+    All depth-(d+1) parents live exclusively among depth-d locals 0..k-1
+    (parent of local j = j // k).  We therefore FORCE locals 0..k-1 into
+    the selection whenever b_{d+1} > 0, then fill remaining slots with topk
+    of the rest.  compute_depth_budget_vector's closure sanitization guarantees
+    b_d >= k whenever b_{d+1} > 0, so no slot overflow is possible.
 
     CUDA-graph compatibility
     ─────────────────────────
@@ -196,8 +209,21 @@ def _depth_aware_topk_indices(
 
     starts, ends, pools = _get_depth_slices(depth, k)
 
-    # ── Step 1: per-depth topK selection ──────────────────────────────────────
-    # Each selected slot retains its real score; all others are -inf.
+    # ── Step 1: per-depth selection with forced generative-parent coverage ───────
+    # For every depth d where the next depth has budget (b_{d+1} > 0), all
+    # depth-(d+1) nodes' parents live exclusively among depth-d locals 0..k-1
+    # (parent of local j = j // k ∈ {0..k-1}).  We therefore FORCE locals 0..k-1
+    # into the selection first, then fill the remaining b_d − k slots with the
+    # topk of locals k..pool_d−1.  compute_depth_budget_vector's closure
+    # sanitization guarantees b_d ≥ k whenever b_{d+1} > 0, so no slot overflow.
+    #
+    # For the last depth (or depths followed by zero budget), a plain per-depth
+    # topk suffices — there are no children to protect.
+    #
+    # This replaces the previous two-step (topk + parent-promotion) approach.
+    # Parent promotion was reactive and could cascade: promoting a parent to +inf
+    # consumed an extra slot, causing the final topk to drop a real node that
+    # might itself have been a parent.  Forcing parents up-front prevents this.
     masked = torch.full_like(score_list_flat, float("-inf"))
     for d_idx in range(depth):
         b_d = depth_budget[d_idx] if d_idx < len(depth_budget) else 0
@@ -206,39 +232,38 @@ def _depth_aware_topk_indices(
             continue  # compile-time constant — no data-dependent branch
         s, e = starts[d_idx], ends[d_idx]
         depth_scores = score_list_flat[:, s:e]              # (bs, pool_d)
-        _, local_idx = torch.topk(depth_scores, n_select, dim=-1, largest=True, sorted=False)
-        global_idx = local_idx + s                          # (bs, n_select)
-        masked.scatter_(1, global_idx, depth_scores.gather(1, local_idx))
 
-    # ── Step 2: ancestor-closure enforcement (shallow → deep) ─────────────────
-    # For each selected depth-d node (d≥2) whose parent at depth d-1 is not yet
-    # selected, promote that parent by writing +inf into masked at the parent's
-    # global slot. +inf outcompetes any real score in the final topk (Step 3).
-    # scatter_reduce_ "amax" is used so that if multiple children share a parent,
-    # the parent slot gets +inf iff at least one child is selected.
-    for d_idx in range(1, depth):
-        pool_child = pools[d_idx]
-        if pool_child <= 0:
-            continue  # compile-time constant
-        s_child  = starts[d_idx]
-        e_child  = ends[d_idx]
-        s_parent = starts[d_idx - 1]
-        child_slice = masked[:, s_child:e_child]            # (bs, pool_child) — static slice
-        selected_mask = child_slice != float("-inf")         # (bs, pool_child) bool
-        # local_parent[j] = j // k  maps local child index → local parent index
-        local_child  = torch.arange(pool_child, device=device)   # (pool_child,)
-        global_parent = local_child // k + s_parent               # (pool_child,)
-        global_parent_exp = global_parent.unsqueeze(0).expand(bs, -1)  # (bs, pool_child)
-        # Build promote_vals: +inf where a child is selected, else -inf so
-        # unselected slots do not overwrite existing selected parents.
-        promote_vals = torch.where(
-            selected_mask,
-            torch.full_like(child_slice, float("inf")),
-            torch.full_like(child_slice, float("-inf")),
+        b_next = (
+            depth_budget[d_idx + 1]
+            if d_idx + 1 < depth and d_idx + 1 < len(depth_budget)
+            else 0
         )
-        masked.scatter_reduce_(1, global_parent_exp, promote_vals, reduce="amax", include_self=True)
+        if b_next > 0:
+            # Force locals 0..k-1 (all depth-(d+1) parents live here)
+            n_forced = k                                     # compile-time constant
+            forced_scores = depth_scores[:, :n_forced]      # (bs, k)
+            forced_global = (
+                torch.arange(n_forced, device=device)
+                .unsqueeze(0)
+                .expand(bs, -1) + s
+            )                                               # (bs, k)
+            masked.scatter_(1, forced_global, forced_scores)
 
-    # ── Step 3: collect selected positions with a static-k topk ───────────────
+            n_extra = n_select - n_forced                   # compile-time constant
+            if n_extra > 0:
+                rest_scores = depth_scores[:, n_forced:]    # (bs, pool_d - k)
+                _, extra_local = torch.topk(
+                    rest_scores, n_extra, dim=-1, largest=True, sorted=False
+                )
+                extra_global = extra_local + s + n_forced   # (bs, n_extra)
+                masked.scatter_(1, extra_global, rest_scores.gather(1, extra_local))
+        else:
+            # Last depth or no next-depth budget: plain per-depth topk
+            _, local_idx = torch.topk(depth_scores, n_select, dim=-1, largest=True, sorted=False)
+            global_idx = local_idx + s                      # (bs, n_select)
+            masked.scatter_(1, global_idx, depth_scores.gather(1, local_idx))
+
+    # ── Step 2: collect selected positions with a static-k topk ──────────────
     # budget_select is a compile-time constant — required for CUDA graph capture.
     budget_select = sum(
         min(depth_budget[d] if d < len(depth_budget) else 0, pools[d])
