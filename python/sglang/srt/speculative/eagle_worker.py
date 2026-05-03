@@ -764,7 +764,6 @@ class EAGLEWorker(TpModelWorker):
         ss_token_list = torch.cat(token_list, dim=1)
         if self.depth_budget is not None:
             # Depth-aware per-depth topK: replaces global topK with per-depth selection.
-            # Requires --disable-cuda-graph (Python-level loop, not graph-capturable).
             top_scores_index = _depth_aware_topk_indices(
                 score_list_flat, self.depth_budget, self.topk, self.speculative_num_steps
             )
@@ -793,7 +792,7 @@ class EAGLEWorker(TpModelWorker):
 
         if getattr(spec_info, "debug_score_list", None) is not None:
             spec_info.debug_score_list.copy_(score_list_flat)
-            spec_info.debug_top_scores_values.copy_(top_scores.values)
+            spec_info.debug_top_scores_values.copy_(top_scores_values)
             spec_info.debug_all_token_ids.copy_(ss_token_list)
 
         # === INSTRUMENTATION: log draft pool in eager (no-CUDA-graph) path ===
