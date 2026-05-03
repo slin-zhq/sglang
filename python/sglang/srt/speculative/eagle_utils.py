@@ -164,78 +164,92 @@ def _depth_aware_topk_indices(
     depth: int,
 ) -> torch.Tensor:
     """
-    Per-depth topK selection.  Returns a (bs, sum(depth_budget)) index tensor
-    sorted by index value (ascending), matching the contract of the global topK path.
+    Per-depth topK selection with ancestor-closure enforcement.
 
-    The draft tree is stored level-by-level in score_list_flat:
-      depth 1 → columns [0, k)
-      depth d >= 2 → columns [k + (d-2)*k², k + (d-1)*k²)
+    Returns a (bs, budget_select) index tensor sorted ascending, where
+    budget_select = sum(min(b_d, pool_d)) for all depths.
 
-    Ancestor closure is maintained because:
-      - keep_shallow_full fills all lower depths completely, so every node at
-        a deep depth has its entire ancestor chain selected.
-      - For partial-fill depths, the within-depth topK naturally selects the
-        highest-scoring candidates; their ancestors are already included by the
-        lower-depth full coverage.
+    Draft tree layout in score_list_flat (flat column index per depth):
+      depth 1 → columns [0, k)              pool size = k
+      depth d ≥ 2 → columns [k+(d-2)*k², k+(d-1)*k²)  pool size = k²
+
+    Within depth d, local index j has parent at depth d-1, local index j // k.
+    Global parent: starts[d-1] + (j // k).
+
+    Ancestor closure
+    ─────────────────
+    The tree kernel (build_tree_efficient in eagle_utils.cu) requires every
+    selected depth-d node's parent at depth d-1 to also be in top_scores_index.
+    A score-only per-depth topK does NOT guarantee this. We add a second pass
+    (Step 2) that promotes every selected node's parent to +inf in the masked
+    tensor, ensuring parents survive the final topk regardless of their score.
 
     CUDA-graph compatibility
     ─────────────────────────
-    The previous implementation iterated over depths in a Python for-loop and
-    conditionally appended tensors, which prevents CUDA graph capture (the graph
-    records a static op sequence; host-side branching on runtime values is
-    illegal inside a captured graph).
-
-    This rewrite eliminates all data-dependent Python control flow:
-    - Depth-slice boundaries (starts/ends) are constant for a given (depth, k)
-      config and are precomputed once at module level.
-    - Per-depth topK is expressed as a fixed sequence of tensor ops: a large
-      negative sentinel is written into non-selected slots so that the global
-      topK on each depth slice picks exactly the right candidates.
-    - The final gather + sort operates on tensors whose shapes are fixed at
-      graph capture time (total_select = sum(depth_budget) is a compile-time
-      constant for a given config).
-
-    Result: the function is safe to call inside a captured CUDA graph.
+    All Python loops iterate over compile-time constants (depth, k, depth_budget).
+    All tensor ops (topk, scatter_, scatter_reduce_, gather) have shapes fixed by
+    the config — not by runtime data values — so the function is safe to call
+    inside a captured CUDA graph.
     """
     bs = score_list_flat.shape[0]
     device = score_list_flat.device
-    total_cols = score_list_flat.shape[1]
 
     starts, ends, pools = _get_depth_slices(depth, k)
 
-    # Build a "masked" score tensor where each depth slot retains its score
-    # only for the top-b_d positions within that depth window, and is set to
-    # -inf elsewhere.  This uses fixed-shape ops (no conditionals on values).
+    # ── Step 1: per-depth topK selection ──────────────────────────────────────
+    # Each selected slot retains its real score; all others are -inf.
     masked = torch.full_like(score_list_flat, float("-inf"))
-
     for d_idx in range(depth):
         b_d = depth_budget[d_idx] if d_idx < len(depth_budget) else 0
         n_select = min(b_d, pools[d_idx])
         if n_select <= 0:
-            continue  # static: n_select is a compile-time constant per config
+            continue  # compile-time constant — no data-dependent branch
         s, e = starts[d_idx], ends[d_idx]
-        depth_scores = score_list_flat[:, s:e]           # (bs, pool_d)
-        # topk on fixed-size slice — shape is static: (bs, n_select)
+        depth_scores = score_list_flat[:, s:e]              # (bs, pool_d)
         _, local_idx = torch.topk(depth_scores, n_select, dim=-1, largest=True, sorted=False)
-        # Scatter the real scores back into the masked tensor at selected positions.
-        # global_idx shape: (bs, n_select) — still fixed.
-        global_idx = local_idx + s
-        # Use scatter to write scores; scatter_ is graph-safe (no Python loop over bs).
+        global_idx = local_idx + s                          # (bs, n_select)
         masked.scatter_(1, global_idx, depth_scores.gather(1, local_idx))
 
-    # Collect all non-(-inf) positions: there are exactly sum(n_selects) of them
-    # (constant at graph-capture time).  We use topk on the full masked row.
-    total_select = sum(
+    # ── Step 2: ancestor-closure enforcement (shallow → deep) ─────────────────
+    # For each selected depth-d node (d≥2) whose parent at depth d-1 is not yet
+    # selected, promote that parent by writing +inf into masked at the parent's
+    # global slot. +inf outcompetes any real score in the final topk (Step 3).
+    # scatter_reduce_ "amax" is used so that if multiple children share a parent,
+    # the parent slot gets +inf iff at least one child is selected.
+    for d_idx in range(1, depth):
+        pool_child = pools[d_idx]
+        if pool_child <= 0:
+            continue  # compile-time constant
+        s_child  = starts[d_idx]
+        e_child  = ends[d_idx]
+        s_parent = starts[d_idx - 1]
+        child_slice = masked[:, s_child:e_child]            # (bs, pool_child) — static slice
+        selected_mask = child_slice != float("-inf")         # (bs, pool_child) bool
+        # local_parent[j] = j // k  maps local child index → local parent index
+        local_child  = torch.arange(pool_child, device=device)   # (pool_child,)
+        global_parent = local_child // k + s_parent               # (pool_child,)
+        global_parent_exp = global_parent.unsqueeze(0).expand(bs, -1)  # (bs, pool_child)
+        # Build promote_vals: +inf where a child is selected, else -inf so
+        # unselected slots do not overwrite existing selected parents.
+        promote_vals = torch.where(
+            selected_mask,
+            torch.full_like(child_slice, float("inf")),
+            torch.full_like(child_slice, float("-inf")),
+        )
+        masked.scatter_reduce_(1, global_parent_exp, promote_vals, reduce="amax", include_self=True)
+
+    # ── Step 3: collect selected positions with a static-k topk ───────────────
+    # budget_select is a compile-time constant — required for CUDA graph capture.
+    budget_select = sum(
         min(depth_budget[d] if d < len(depth_budget) else 0, pools[d])
         for d in range(depth)
     )
-    if total_select <= 0:
+    if budget_select <= 0:
         return torch.zeros((bs, 0), dtype=torch.long, device=device)
 
-    # topk with k=total_select on the masked row picks exactly the kept slots.
-    _, all_selected = torch.topk(masked, total_select, dim=-1, largest=True, sorted=False)
-    # Sort ascending to match the contract (index-order consistency with global topK path).
+    _, all_selected = torch.topk(masked, budget_select, dim=-1, largest=True, sorted=False)
     return torch.sort(all_selected, dim=-1).values
+
 
 
 def organize_draft_results(
