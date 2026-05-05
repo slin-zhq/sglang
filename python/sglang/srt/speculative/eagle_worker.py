@@ -97,6 +97,22 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+
+        # Cap budget to the actual draft pool size.
+        # Pool per batch item: topk (step 0) + (steps-1)*topk² (each later step produces topk×topk candidates).
+        # Requesting k = budget-1 > pool_size causes torch.topk to crash with "selected index k out of range".
+        _pool_size = self.topk + max(0, self.speculative_num_steps - 1) * self.topk ** 2
+        if self.speculative_num_draft_tokens - 1 > _pool_size:
+            _capped_budget = _pool_size + 1
+            logger.warning(
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens} exceeds the draft pool "
+                f"capacity {_pool_size} for d{self.speculative_num_steps}k{self.topk} "
+                f"(pool = topk + (steps-1)*topk² = {self.topk} + {max(0, self.speculative_num_steps - 1)}×{self.topk**2}). "
+                f"Capping to {_capped_budget}."
+            )
+            self.speculative_num_draft_tokens = _capped_budget
+            server_args.speculative_num_draft_tokens = _capped_budget
+
         # Depth-aware budget allocation: computed once from config, reused every cycle.
         # None means use original global topK (baseline).
         self.depth_budget = compute_depth_budget_vector(
