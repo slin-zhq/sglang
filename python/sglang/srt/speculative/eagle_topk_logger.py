@@ -7,7 +7,9 @@ Environment variables controlling behaviour:
   EAGLE_TOPK_EXP_LOG_ENABLE    - "1" to enable all logging (default: "1")
   EAGLE_TOPK_EXP_LOG_PATH      - absolute directory where JSONL files are written.
                                  The benchmark script sets this per config/dataset/rep/turn.
-                                 Default: /mnt/zhiqi/sglang_eagle3_optimize/outputs/torch_topk_optimization
+                                 Default: <repo_root>/outputs/torch_topk_optimization
+                                 (auto-detected relative to this file; works on both
+                                  DeltaWW /mnt/zhiqi/... and MIRLab /home/r13922176/...)
   EAGLE_ATTN_MS_LOG_ENABLE     - "1" to additionally instrument the FlashInfer
                                  TARGET_VERIFY attention call with torch.cuda.Event
                                  and emit `attn_ms` in timing.jsonl. Default: "0".
@@ -47,8 +49,12 @@ import torch
 # ──────────────────────────────────────────────
 # Configuration (read once at module import)
 # ──────────────────────────────────────────────
-_DEFAULT_LOG_PATH = (
-    "/mnt/zhiqi/sglang_eagle3_optimize/outputs/torch_topk_optimization"
+# Derive repo root from this file's location:
+#   .../sglang_eagle3_optimize/sglang/python/sglang/srt/speculative/eagle_topk_logger.py
+#                             ^parents[5]
+# Works on both DeltaWW (/mnt/zhiqi/...) and MIRLab (/home/r13922176/...).
+_DEFAULT_LOG_PATH = str(
+    Path(__file__).resolve().parents[5] / "outputs" / "torch_topk_optimization"
 )
 
 ENABLED: bool = os.environ.get("EAGLE_TOPK_EXP_LOG_ENABLE", "1") == "1"
@@ -292,6 +298,11 @@ def _get_file_handle(filename: str):
 
 
 def _write_jsonl(filename: str, record: dict) -> None:
+    # question_id == -1 means no real benchmark turn is active (e.g. CUDA graph
+    # capture warmup calls draft_forward before set_record_context is called).
+    # Silently discard rather than writing to the default fallback directory.
+    if _record_context["question_id"] == -1:
+        return
     full_path = os.path.join(LOG_PATH, filename)
     with _lock:
         record_to_write = dict(record)
