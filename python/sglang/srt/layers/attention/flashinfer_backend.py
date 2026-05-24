@@ -26,6 +26,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -811,6 +812,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            # === INSTRUMENTATION: per-layer attn time for TARGET_VERIFY (optional) ===
+            # Gated on SPEC_ATTN_MS_LOG_ENABLE=1. Skipped during CUDA graph capture
+            # because event handles recorded in the graph replay identically on every
+            # step, making per-replay timing unreliable.
+            _attn_instrument = (
+                _logger.ENABLED
+                and _logger.ATTN_MS_ENABLED
+                and forward_batch.forward_mode.is_target_verify()
+                and not _logger._is_cuda_graph_capturing()
+            )
+            if _attn_instrument:
+                _evt_start = torch.cuda.Event(enable_timing=True)
+                _evt_end = torch.cuda.Event(enable_timing=True)
+                _evt_start.record()
+
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -835,6 +851,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            if _attn_instrument:
+                _evt_end.record()
+                _logger.accumulate_attn_event(_evt_start, _evt_end)
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over

@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.speculative import spec_cycle_logger as _logger
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -1171,7 +1173,12 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        _cycle_idx = _logger.begin_cycle() if _logger.ENABLED else 0
+        _t_cycle_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
+
+        _t_draft_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
         self._prepare_for_speculative_decoding(batch, draft_input)
+        _t_draft_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
         assert batch.forward_mode.is_target_verify()
         verify_input = batch.spec_info
@@ -1184,6 +1191,7 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        _t_verify_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
         )
@@ -1202,6 +1210,7 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1220,6 +1229,26 @@ class DFlashWorker:
         batch.forward_mode = ForwardMode.DECODE
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
+
+        if _logger.ENABLED:
+            _t_cycle_end = _logger._sync_and_time()
+            _bs = len(num_correct_drafts_per_req_cpu)
+            _accept_length = (
+                num_correct_drafts_per_req_cpu[0] + 1 if _bs == 1
+                else sum(n + 1 for n in num_correct_drafts_per_req_cpu) / _bs
+            )
+            _logger.log_timing(
+                cycle_idx=_cycle_idx,
+                timings={
+                    "draft_ms":    round((_t_draft_end  - _t_draft_start)  * 1000, 4),
+                    "verify_ms":   round((_t_verify_end - _t_verify_start) * 1000, 4),
+                    "extend_ms":   0.0,
+                    "cycle_ms":    round((_t_cycle_end  - _t_cycle_start)  * 1000, 4),
+                    "accept_length": _accept_length,
+                    "prefix_lens": None,
+                },
+            )
+
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
                 "DFLASH verify completed. num_correct_drafts_per_req=%s",

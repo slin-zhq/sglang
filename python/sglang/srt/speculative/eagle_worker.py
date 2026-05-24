@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -482,6 +483,8 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            _cycle_idx = _logger.begin_cycle() if _logger.ENABLED else 0
+            _t_cycle_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
             with (
@@ -489,14 +492,26 @@ class EAGLEWorker(TpModelWorker):
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
+                _t_draft_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
                 verify_input = self.draft(batch)
+                _t_draft_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
+            if _logger.ENABLED:
+                try:
+                    _prefix_lens = batch.seq_lens.tolist()
+                except Exception:
+                    _prefix_lens = None
+            else:
+                _prefix_lens = None
+
+            _t_verify_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
             # Install verify_input as `batch.spec_info` for the verify forward.
             batch.spec_info = verify_input
             verify_output = self.verify(batch)
+            _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -523,18 +538,31 @@ class EAGLEWorker(TpModelWorker):
                     self.server_args.enable_dp_attention
                     or draft_extend_input.input_ids.shape[0] > 0
                 ):
-                    # decode is not finished; install draft_extend_input for
-                    # the extend forward, then install the next-iter
-                    # EagleDraftInput it returns.
+                    _t_extend_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
                     batch.spec_info = draft_extend_input
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
+                    _t_extend_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
                 else:
-                    # All reqs finished and dp_attention isn't forcing extend.
-                    # Install an idle EagleDraftInput so next iter's scheduler
-                    # ops (merge_batch / filter_batch) see well-typed empty
-                    # tensors instead of None.
+                    _t_extend_start = _t_extend_end = _t_verify_end
                     self._draft_preprocess_idle(batch)
+
+            _t_cycle_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
+            if _logger.ENABLED:
+                _accept_len = sum(verify_output.num_correct_drafts_per_req_cpu) / max(
+                    1, len(verify_output.num_correct_drafts_per_req_cpu)
+                ) + 1
+                _logger.log_timing(
+                    cycle_idx=_cycle_idx,
+                    timings={
+                        "draft_ms":  round((_t_draft_end  - _t_draft_start)  * 1000, 4),
+                        "verify_ms": round((_t_verify_end - _t_verify_start) * 1000, 4),
+                        "extend_ms": round((_t_extend_end - _t_extend_start) * 1000, 4),
+                        "cycle_ms":  round((_t_cycle_end  - _t_cycle_start)  * 1000, 4),
+                        "accept_length": _accept_len,
+                        "prefix_lens": _prefix_lens,
+                    },
+                )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -569,6 +597,7 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+        _t_prefill_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
@@ -576,6 +605,10 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.capture_hidden_mode = capture_mode
         batch_result = self.target_worker.forward_batch_generation(batch)
+        if _logger.ENABLED:
+            _logger.log_prefill_timing(
+                prefill_ms=(_logger._sync_and_time() - _t_prefill_start) * 1000.0
+            )
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
