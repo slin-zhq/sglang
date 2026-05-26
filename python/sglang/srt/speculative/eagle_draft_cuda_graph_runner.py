@@ -25,7 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -131,17 +131,17 @@ class EAGLEDraftCudaGraphRunner:
             )
             debug_score_list = (
                 torch.zeros((self.max_bs, self.candidate_count), dtype=torch.float32)
-                if _exp_logger.ENABLED
+                if _logger.ENABLED
                 else None
             )
             debug_top_scores_values = (
                 torch.zeros((self.max_bs, self.top_scores_count), dtype=torch.float32)
-                if _exp_logger.ENABLED
+                if _logger.ENABLED
                 else None
             )
             debug_all_token_ids = (
                 torch.zeros((self.max_bs, self.candidate_count), dtype=torch.int64)
-                if _exp_logger.ENABLED
+                if _logger.ENABLED
                 else None
             )
 
@@ -463,8 +463,8 @@ class EAGLEDraftCudaGraphRunner:
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 
-        if _exp_logger.ENABLED and buffers.debug_score_list is not None:
-            _exp_logger.log_organize_draft_results(
+        if _logger.ENABLED and buffers.debug_score_list is not None:
+            _logger.log_organize_draft_results(
                 score_list_flat=buffers.debug_score_list[:raw_bs],
                 top_scores_indices=out[1],
                 top_scores_values=buffers.debug_top_scores_values[:raw_bs],

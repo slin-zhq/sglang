@@ -39,7 +39,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.eagle_utils import compute_depth_budget_vector, _depth_aware_topk_indices
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -352,15 +352,15 @@ class EAGLEWorker(TpModelWorker):
             # It atomically increments the counter and sets _current_cycle_idx,
             # which is then read by log_organize_draft_results (inside replay())
             # and log_verify_result (inside verify()) for the same cycle. ===
-            _cycle_idx = _exp_logger.begin_cycle() if _exp_logger.ENABLED else 0
-            _t_cycle_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+            _cycle_idx = _logger.begin_cycle() if _logger.ENABLED else 0
+            _t_cycle_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                _t_draft_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+                _t_draft_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
                 spec_info = self.draft(batch)
-                _t_draft_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+                _t_draft_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
@@ -369,7 +369,7 @@ class EAGLEWorker(TpModelWorker):
             # cached) immediately before the verify forward. Needed to control
             # for prefix growth when studying FA2 CTA_TILE_Q tile boundaries.
             # See docs/budget_vs_verify_time/verify_flashinfer_ctaTileQ.md §5.1.1.
-            if _exp_logger.ENABLED:
+            if _logger.ENABLED:
                 try:
                     _prefix_lens = batch.seq_lens.tolist()
                 except Exception:
@@ -377,11 +377,11 @@ class EAGLEWorker(TpModelWorker):
             else:
                 _prefix_lens = None
 
-            _t_verify_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+            _t_verify_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
-            _t_verify_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+            _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -402,17 +402,17 @@ class EAGLEWorker(TpModelWorker):
                     or batch.spec_info.verified_id.shape[0] > 0
                 ):
                     # decode is not finished
-                    _t_extend_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+                    _t_extend_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
                     self.forward_draft_extend_after_decode(batch)
-                    _t_extend_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+                    _t_extend_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
                 else:
                     _t_extend_start = _t_extend_end = _t_verify_end
 
-            _t_cycle_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+            _t_cycle_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             # === INSTRUMENTATION: log per-cycle timings ===
-            if _exp_logger.ENABLED:
-                _exp_logger.log_timing(
+            if _logger.ENABLED:
+                _logger.log_timing(
                     cycle_idx=_cycle_idx,
                     timings={
                         "draft_ms": round((_t_draft_end - _t_draft_start) * 1000, 4),
@@ -470,13 +470,13 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        _t_prefill_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+        _t_prefill_start = _logger._sync_and_time() if _logger.ENABLED else 0.0
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-        if _exp_logger.ENABLED:
-            _t_prefill_end = _exp_logger._sync_and_time()
-            _exp_logger.log_prefill_timing(
+        if _logger.ENABLED:
+            _t_prefill_end = _logger._sync_and_time()
+            _logger.log_prefill_timing(
                 prefill_ms=(_t_prefill_end - _t_prefill_start) * 1000.0
             )
         logits_output, next_token_ids = (
@@ -836,8 +836,8 @@ class EAGLEWorker(TpModelWorker):
         # EAGLEDraftCudaGraphRunner.replay() for runs with --disable-cuda-graph.
         # We read directly from local tensors rather than the debug_score_list
         # buffers (those are graph-capture-time allocations and may be None here).
-        if _exp_logger.ENABLED:
-            _exp_logger.log_organize_draft_results(
+        if _logger.ENABLED:
+            _logger.log_organize_draft_results(
                 score_list_flat=score_list_flat,
                 top_scores_indices=top_scores_index,
                 top_scores_values=top_scores_values,

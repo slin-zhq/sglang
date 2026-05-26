@@ -26,7 +26,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -805,10 +805,10 @@ class FlashInferAttnBackend(AttentionBackend):
             # the graph record the same handle on every replay, making per-replay
             # timing unreliable. See verify_flashinfer_ctaTileQ.md §5.2.1.
             _attn_instrument = (
-                _exp_logger.ENABLED
-                and _exp_logger.ATTN_MS_ENABLED
+                _logger.ENABLED
+                and _logger.ATTN_MS_ENABLED
                 and forward_batch.forward_mode.is_target_verify()
-                and not _exp_logger._is_cuda_graph_capturing()
+                and not _logger._is_cuda_graph_capturing()
             )
             if _attn_instrument:
                 _evt_start = torch.cuda.Event(enable_timing=True)
@@ -841,7 +841,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if _attn_instrument:
                 _evt_end.record()
-                _exp_logger.accumulate_attn_event(_evt_start, _evt_end)
+                _logger.accumulate_attn_event(_evt_start, _evt_end)
             # === END INSTRUMENTATION ===
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in

@@ -30,7 +30,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
-from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -331,7 +331,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
             # === INSTRUMENTATION: log oracle acceptance data ===
-            if _exp_logger.ENABLED:
+            if _logger.ENABLED:
                 # Optionally extract target model log-probs at accepted positions.
                 # logits_output.next_token_logits shape: (bs * draft_token_num, vocab_size).
                 # Row b*T + p contains the target's distribution predicting the token
@@ -339,9 +339,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 t_accept_lp = None
                 t_top5_tok = None
                 t_top5_lp = None
-                if _exp_logger.TARGET_LOGITS_ENABLED:
+                if _logger.TARGET_LOGITS_ENABLED:
                     import torch as _torch
-                    _topk_n = _exp_logger.TARGET_LOGITS_TOPK
+                    _topk_n = _logger.TARGET_LOGITS_TOPK
                     T = self.draft_token_num
                     logits = logits_output.next_token_logits  # (bs*T, vocab)
                     log_probs = _torch.log_softmax(logits.float(), dim=-1)
@@ -367,7 +367,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         t_topn_tok.append(b_tnt)
                         t_topn_lp.append(b_tnlp)
 
-                _exp_logger.log_verify_result(
+                _logger.log_verify_result(
                     candidates=candidates,
                     target_predict=target_predict,
                     accept_index=accept_index,
