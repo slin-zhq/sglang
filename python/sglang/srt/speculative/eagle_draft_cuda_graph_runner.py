@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative import eagle_topk_logger as _exp_logger
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -49,6 +50,9 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
+    debug_score_list: Optional[torch.Tensor]
+    debug_top_scores_values: Optional[torch.Tensor]
+    debug_all_token_ids: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -74,6 +78,7 @@ class EAGLEDraftCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.speculative_num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -87,6 +92,8 @@ class EAGLEDraftCudaGraphRunner:
         self.num_tokens_per_bs = self.topk
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.candidate_count = self.topk + (self.speculative_num_steps - 1) * self.topk * self.topk
+        self.top_scores_count = self.speculative_num_draft_tokens - 1
 
         self.model_runner.draft_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -122,6 +129,21 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
+            debug_score_list = (
+                torch.zeros((self.max_bs, self.candidate_count), dtype=torch.float32)
+                if _exp_logger.ENABLED
+                else None
+            )
+            debug_top_scores_values = (
+                torch.zeros((self.max_bs, self.top_scores_count), dtype=torch.float32)
+                if _exp_logger.ENABLED
+                else None
+            )
+            debug_all_token_ids = (
+                torch.zeros((self.max_bs, self.candidate_count), dtype=torch.int64)
+                if _exp_logger.ENABLED
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -153,6 +175,9 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            debug_score_list=debug_score_list,
+            debug_top_scores_values=debug_top_scores_values,
+            debug_all_token_ids=debug_all_token_ids,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -279,6 +304,15 @@ class EAGLEDraftCudaGraphRunner:
             topk_index=topk_index,
             hidden_states=hidden_states,
             capture_hidden_mode=CaptureHiddenMode.LAST,
+            debug_score_list=buffers.debug_score_list[:num_seqs]
+            if buffers.debug_score_list is not None
+            else None,
+            debug_top_scores_values=buffers.debug_top_scores_values[:num_seqs]
+            if buffers.debug_top_scores_values is not None
+            else None,
+            debug_all_token_ids=buffers.debug_all_token_ids[:num_seqs]
+            if buffers.debug_all_token_ids is not None
+            else None,
         )
 
         # Forward batch
@@ -428,5 +462,14 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+
+        if _exp_logger.ENABLED and buffers.debug_score_list is not None:
+            _exp_logger.log_organize_draft_results(
+                score_list_flat=buffers.debug_score_list[:raw_bs],
+                top_scores_indices=out[1],
+                top_scores_values=buffers.debug_top_scores_values[:raw_bs],
+                all_token_ids=buffers.debug_all_token_ids[:raw_bs],
+                num_draft_token=self.speculative_num_draft_tokens,
+            )
 
         return out

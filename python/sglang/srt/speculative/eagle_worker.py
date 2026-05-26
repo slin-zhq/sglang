@@ -39,6 +39,8 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative import eagle_topk_logger as _exp_logger
+from sglang.srt.speculative.eagle_utils import compute_depth_budget_vector, _depth_aware_topk_indices
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -97,6 +99,36 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+
+        # Cap budget to the actual draft pool size.
+        # Pool per batch item: topk (step 0) + (steps-1)*topk² (each later step produces topk×topk candidates).
+        # Requesting k = budget-1 > pool_size causes torch.topk to crash with "selected index k out of range".
+        _pool_size = self.topk + max(0, self.speculative_num_steps - 1) * self.topk ** 2
+        if self.speculative_num_draft_tokens - 1 > _pool_size:
+            _capped_budget = _pool_size + 1
+            logger.warning(
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens} exceeds the draft pool "
+                f"capacity {_pool_size} for d{self.speculative_num_steps}k{self.topk} "
+                f"(pool = topk + (steps-1)*topk² = {self.topk} + {max(0, self.speculative_num_steps - 1)}×{self.topk**2}). "
+                f"Capping to {_capped_budget}."
+            )
+            self.speculative_num_draft_tokens = _capped_budget
+            server_args.speculative_num_draft_tokens = _capped_budget
+
+        # Depth-aware budget allocation: computed once from config, reused every cycle.
+        # None means use original global topK (baseline).
+        self.depth_budget = compute_depth_budget_vector(
+            depth=self.speculative_num_steps,
+            k=self.topk,
+            candidate_budget=self.speculative_num_draft_tokens - 1,
+            technique=server_args.speculative_budget_allocation,
+        )
+        if self.depth_budget is not None:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                f"Depth-aware budget allocation: technique={server_args.speculative_budget_allocation!r}  "
+                f"b_per_depth={self.depth_budget}  sum={sum(self.depth_budget)}"
+            )
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -316,17 +348,40 @@ class EAGLEWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
+            # === INSTRUMENTATION: begin_cycle() must be called first.
+            # It atomically increments the counter and sets _current_cycle_idx,
+            # which is then read by log_organize_draft_results (inside replay())
+            # and log_verify_result (inside verify()) for the same cycle. ===
+            _cycle_idx = _exp_logger.begin_cycle() if _exp_logger.ENABLED else 0
+            _t_cycle_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                _t_draft_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
                 spec_info = self.draft(batch)
+                _t_draft_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
+            # Capture per-request prefix length (context KV tokens already
+            # cached) immediately before the verify forward. Needed to control
+            # for prefix growth when studying FA2 CTA_TILE_Q tile boundaries.
+            # See docs/budget_vs_verify_time/verify_flashinfer_ctaTileQ.md §5.1.1.
+            if _exp_logger.ENABLED:
+                try:
+                    _prefix_lens = batch.seq_lens.tolist()
+                except Exception:
+                    _prefix_lens = None
+            else:
+                _prefix_lens = None
+
+            _t_verify_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            _t_verify_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -347,7 +402,27 @@ class EAGLEWorker(TpModelWorker):
                     or batch.spec_info.verified_id.shape[0] > 0
                 ):
                     # decode is not finished
+                    _t_extend_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
                     self.forward_draft_extend_after_decode(batch)
+                    _t_extend_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+                else:
+                    _t_extend_start = _t_extend_end = _t_verify_end
+
+            _t_cycle_end = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
+
+            # === INSTRUMENTATION: log per-cycle timings ===
+            if _exp_logger.ENABLED:
+                _exp_logger.log_timing(
+                    cycle_idx=_cycle_idx,
+                    timings={
+                        "draft_ms": round((_t_draft_end - _t_draft_start) * 1000, 4),
+                        "verify_ms": round((_t_verify_end - _t_verify_start) * 1000, 4),
+                        "extend_ms": round((_t_extend_end - _t_extend_start) * 1000, 4),
+                        "cycle_ms": round((_t_cycle_end - _t_cycle_start) * 1000, 4),
+                        "prefix_lens": _prefix_lens,
+                    },
+                )
+            # === END INSTRUMENTATION ===
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -395,9 +470,15 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+        _t_prefill_start = _exp_logger._sync_and_time() if _exp_logger.ENABLED else 0.0
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        if _exp_logger.ENABLED:
+            _t_prefill_end = _exp_logger._sync_and_time()
+            _exp_logger.log_prefill_timing(
+                prefill_ms=(_t_prefill_end - _t_prefill_start) * 1000.0
+            )
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -408,6 +489,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
+
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
@@ -714,9 +796,55 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        score_list_flat = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        if self.depth_budget is not None:
+            # Depth-aware per-depth topK: replaces global topK with per-depth selection.
+            top_scores_index = _depth_aware_topk_indices(
+                score_list_flat, self.depth_budget, self.topk, self.speculative_num_steps
+            )
+            # Scores at selected (index-sorted) positions, needed by logger.
+            top_scores_values = score_list_flat.gather(1, top_scores_index)
+        else:
+            top_scores = torch.topk(
+                score_list_flat, self.speculative_num_draft_tokens - 1, dim=-1
+            )
+            top_scores_index = torch.sort(top_scores.indices).values
+            # Re-gather scores in index-sorted order to match the logger's expectation.
+            top_scores_values = score_list_flat.gather(1, top_scores_index)
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
         )
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        if getattr(spec_info, "debug_score_list", None) is not None:
+            spec_info.debug_score_list.copy_(score_list_flat)
+            spec_info.debug_top_scores_values.copy_(top_scores_values)
+            spec_info.debug_all_token_ids.copy_(ss_token_list)
+
+        # === INSTRUMENTATION: log draft pool in eager (no-CUDA-graph) path ===
+        # This mirrors the log_organize_draft_results() call in
+        # EAGLEDraftCudaGraphRunner.replay() for runs with --disable-cuda-graph.
+        # We read directly from local tensors rather than the debug_score_list
+        # buffers (those are graph-capture-time allocations and may be None here).
+        if _exp_logger.ENABLED:
+            _exp_logger.log_organize_draft_results(
+                score_list_flat=score_list_flat,
+                top_scores_indices=top_scores_index,
+                top_scores_values=top_scores_values,
+                all_token_ids=ss_token_list,
+                num_draft_token=self.speculative_num_draft_tokens,
+            )
+        # === END INSTRUMENTATION ===
 
         return parent_list, top_scores_index, draft_tokens
 
