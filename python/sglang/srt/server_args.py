@@ -510,6 +510,8 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    log_dark_attention: bool = False
+    dark_attention_csv: str = ""
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5216,6 +5218,18 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--log-dark-attention",
+            action="store_true",
+            default=ServerArgs.log_dark_attention,
+            help="Log DARK per-position draft/acceptance statistics to CSV.",
+        )
+        parser.add_argument(
+            "--dark-attention-csv",
+            type=str,
+            default=ServerArgs.dark_attention_csv,
+            help="Output path for --log-dark-attention. Defaults to DARK_ATTENTION_CSV or the speculative logger path.",
         )
 
         # Speculative decoding (ngram)

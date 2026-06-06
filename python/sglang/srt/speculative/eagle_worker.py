@@ -39,8 +39,8 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative import dark_logger
 from sglang.srt.speculative import spec_cycle_logger as _logger
-from sglang.srt.speculative.eagle_utils import compute_depth_budget_vector, _depth_aware_topk_indices
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -48,7 +48,9 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
+    compute_depth_budget_vector,
     organize_draft_results,
+    _depth_aware_topk_indices,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -99,6 +101,9 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.log_dark_attention = bool(server_args.log_dark_attention) and tp_rank == 0
+        if self.log_dark_attention:
+            dark_logger.init_dark_logger(server_args.dark_attention_csv)
 
         # Cap budget to the actual draft pool size.
         # Pool per batch item: topk (step 0) + (steps-1)*topk² (each later step produces topk×topk candidates).
@@ -383,6 +388,9 @@ class EAGLEWorker(TpModelWorker):
             )
             _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
+            if self.log_dark_attention:
+                self._log_dark_attention_rows(spec_info, verify_output)
+
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
                     accepted = verify_output.accept_length_per_req_cpu[idx]
@@ -660,6 +668,9 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        self._last_dark_top1_prob = None
+        self._last_dark_entropy = None
+        self._last_dark_depth = None
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -720,6 +731,9 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
+            dark_top1_prob=self._last_dark_top1_prob,
+            dark_entropy=self._last_dark_entropy,
+            dark_depth=self._last_dark_depth,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -749,10 +763,35 @@ class EAGLEWorker(TpModelWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        dark_prob_list: List[torch.Tensor] = []
+        dark_entropy_list: List[torch.Tensor] = []
+        topk_entropy = None
 
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            if self.log_dark_attention:
+                if i == 0:
+                    topk_p_float = topk_p.float()
+                    entropy = -(
+                        topk_p_float * topk_p_float.clamp_min(1e-20).log()
+                    ).sum(dim=-1)
+                    dark_prob_list.append(topk_p.unsqueeze(1))
+                    dark_entropy_list.append(
+                        entropy.reshape(forward_batch.batch_size, 1, 1).expand(
+                            -1, 1, self.topk
+                        )
+                    )
+                else:
+                    dark_prob_list.append(
+                        topk_p.reshape(forward_batch.batch_size, self.topk, self.topk)
+                    )
+                    dark_entropy_list.append(
+                        topk_entropy.reshape(
+                            forward_batch.batch_size, self.topk, 1
+                        ).expand(-1, -1, self.topk)
+                    )
+
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -785,6 +824,11 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            if self.log_dark_attention:
+                probs_float = probs.float()
+                topk_entropy = -(
+                    probs_float * probs_float.clamp_min(1e-20).log()
+                ).sum(dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
@@ -819,6 +863,14 @@ class EAGLEWorker(TpModelWorker):
             "draft_forward: top_scores_index OOB for gather on ss_token_list",
         )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        if self.log_dark_attention and dark_prob_list:
+            dark_prob_flat = torch.cat(dark_prob_list, dim=1).flatten(1)
+            dark_entropy_flat = torch.cat(dark_entropy_list, dim=1).flatten(1)
+            self._last_dark_top1_prob = dark_prob_flat.gather(1, top_scores_index)
+            self._last_dark_entropy = dark_entropy_flat.gather(1, top_scores_index)
+            self._last_dark_depth = self._depth_from_flat_candidate_index(
+                top_scores_index
+            )
 
         if len(parents_list) > 1:
             parent_list = torch.cat(parents_list[:-1], dim=1)
@@ -848,8 +900,68 @@ class EAGLEWorker(TpModelWorker):
 
         return parent_list, top_scores_index, draft_tokens
 
+    def _depth_from_flat_candidate_index(
+        self, candidate_index: torch.Tensor
+    ) -> torch.Tensor:
+        depth = torch.zeros_like(candidate_index)
+        if self.speculative_num_steps <= 1:
+            return depth
+        later = candidate_index >= self.topk
+        depth[later] = (
+            (candidate_index[later] - self.topk) // (self.topk * self.topk)
+        ) + 1
+        return depth
+
+    def _log_dark_attention_rows(
+        self,
+        spec_info: EagleVerifyInput,
+        verify_output: EagleVerifyOutput,
+    ) -> None:
+        if (
+            spec_info.dark_top1_prob is None
+            or spec_info.dark_entropy is None
+            or spec_info.dark_depth is None
+        ):
+            return
+
+        dark_logger.mark_attention_unavailable()
+        prompt_id, block_id = dark_logger.current_prompt_and_block()
+        top1_cpu = spec_info.dark_top1_prob.detach().float().cpu()
+        entropy_cpu = spec_info.dark_entropy.detach().float().cpu()
+        depth_cpu = spec_info.dark_depth.detach().cpu()
+
+        draft_count = top1_cpu.shape[1]
+        accepted_by_batch = [set() for _ in range(top1_cpu.shape[0])]
+        for flat_idx in verify_output.accepted_indices.detach().cpu().reshape(-1):
+            idx = int(flat_idx.item())
+            b = idx // self.speculative_num_draft_tokens
+            slot = idx % self.speculative_num_draft_tokens
+            if 0 <= b < len(accepted_by_batch) and slot > 0:
+                accepted_by_batch[b].add(slot - 1)
+
+        for b in range(top1_cpu.shape[0]):
+            accepted = accepted_by_batch[b]
+            for j in range(draft_count):
+                dark_logger.log_dark_row(
+                    prompt_id=prompt_id,
+                    block_id=block_id,
+                    pos_j=j,
+                    C_j=0.0,
+                    D_j=0.0,
+                    attn_input_max=0.0,
+                    attn_self_jminus1=0.0,
+                    attn_self_jplus1=0.0,
+                    attn_self_jminus2=0.0,
+                    depth=int(depth_cpu[b, j].item()),
+                    top1_prob=float(top1_cpu[b, j].item()),
+                    H_j=float(entropy_cpu[b, j].item()),
+                    accept_j=1 if j in accepted else 0,
+                )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
+        if self.log_dark_attention:
+            dark_logger.close_dark_logger()
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):

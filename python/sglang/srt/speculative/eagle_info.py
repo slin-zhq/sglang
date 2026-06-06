@@ -74,6 +74,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    # Optional DARK logging metadata, one entry per selected draft token
+    # excluding the leading verified token.
+    dark_top1_prob: Optional[torch.Tensor] = None
+    dark_entropy: Optional[torch.Tensor] = None
+    dark_depth: Optional[torch.Tensor] = None
+
     # Shape info for padding
     num_tokens_per_req: int = -1
 
