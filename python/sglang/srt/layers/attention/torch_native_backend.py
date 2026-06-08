@@ -122,8 +122,15 @@ class TorchNativeAttnBackend(AttentionBackend):
                 # Compute attention explicitly to capture weights for DARK logging.
                 # Scale: use provided scaling or 1/sqrt(head_dim).
                 scale = scaling if scaling is not None else (1.0 / math.sqrt(per_req_key.shape[-1]))
+                # GQA: expand KV heads to match Q heads if needed.
+                dk_q, dk_k = per_req_query_redudant, per_req_key
+                dk_v = per_req_value
+                if enable_gqa and dk_q.shape[0] != dk_k.shape[0]:
+                    repeat = dk_q.shape[0] // dk_k.shape[0]
+                    dk_k = dk_k.repeat_interleave(repeat, dim=0)
+                    dk_v = dk_v.repeat_interleave(repeat, dim=0)
                 # [heads, seq_len_kv, seq_len_kv]
-                raw_scores = torch.matmul(per_req_query_redudant, per_req_key.transpose(-2, -1)) * scale
+                raw_scores = torch.matmul(dk_q, dk_k.transpose(-2, -1)) * scale
                 if causal:
                     # Build causal mask: each position only attends to itself and earlier positions
                     mask = torch.triu(
@@ -135,7 +142,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 # Store only the last seq's weights (single-seq decode is the common case).
                 _dl.store_layer_attn(layer_id, attn_w.detach().cpu(), int(prefill_seq_len_q))
                 per_req_out_redudant = (
-                    torch.matmul(attn_w, per_req_value)
+                    torch.matmul(attn_w, dk_v)
                     .movedim(query.dim() - 2, 0)
                 )
             else:
