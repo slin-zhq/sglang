@@ -33,7 +33,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor | None,
         extend_seq_lens: torch.Tensor,
         scaling=None,
         enable_gqa=False,
@@ -59,7 +59,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
-        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+        if extend_prefix_lens is None:
+            extend_prefix_lens = torch.zeros_like(seq_lens)
+        else:
+            assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
