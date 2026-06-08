@@ -59,18 +59,24 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
-        if extend_prefix_lens is None:
-            extend_prefix_lens = torch.zeros_like(seq_lens)
-        else:
-            assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
-        if extend_seq_lens is None:
-            # query shape before movedim: [total_query_tokens, num_heads, head_size]
-            # derive per-sequence extend lengths from the actual query token count
+        # In speculative decoding, both may be None. Invariant:
+        #   extend_prefix_lens + extend_seq_lens == seq_lens
+        # Derive whichever is missing from the other two.
+        if extend_prefix_lens is None and extend_seq_lens is None:
+            # query: [total_new_tokens, heads, head_dim] before movedim
             total_q_tokens = query.shape[0]
             n_seqs = seq_lens.shape[0]
             per_seq = total_q_tokens // n_seqs
             extend_seq_lens = seq_lens.new_full((n_seqs,), per_seq)
+            extend_prefix_lens = seq_lens - extend_seq_lens
+        elif extend_prefix_lens is None:
+            assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+            extend_prefix_lens = seq_lens - extend_seq_lens
+        elif extend_seq_lens is None:
+            assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+            extend_seq_lens = seq_lens - extend_prefix_lens
         else:
+            assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
             assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
