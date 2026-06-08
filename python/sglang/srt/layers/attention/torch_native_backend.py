@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,6 +39,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        layer_id: int = -1,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -115,18 +117,40 @@ class TorchNativeAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
+            from sglang.srt.speculative import dark_logger as _dl
+            if _dl.DARK_ENABLED and layer_id >= 0:
+                # Compute attention explicitly to capture weights for DARK logging.
+                # Scale: use provided scaling or 1/sqrt(head_dim).
+                scale = scaling if scaling is not None else (1.0 / math.sqrt(per_req_key.shape[-1]))
+                # [heads, seq_len_kv, seq_len_kv]
+                raw_scores = torch.matmul(per_req_query_redudant, per_req_key.transpose(-2, -1)) * scale
+                if causal:
+                    # Build causal mask: each position only attends to itself and earlier positions
+                    mask = torch.triu(
+                        torch.ones(seq_len_kv, seq_len_kv, dtype=torch.bool, device=raw_scores.device),
+                        diagonal=1,
+                    )
+                    raw_scores = raw_scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+                attn_w = torch.softmax(raw_scores, dim=-1)  # [heads, kv, kv]
+                # Store only the last seq's weights (single-seq decode is the common case).
+                _dl.store_layer_attn(layer_id, attn_w.detach().cpu(), int(prefill_seq_len_q))
+                per_req_out_redudant = (
+                    torch.matmul(attn_w, per_req_value)
+                    .movedim(query.dim() - 2, 0)
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
+            else:
+                per_req_out_redudant = (
+                    scaled_dot_product_attention(
+                        per_req_query_redudant.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
             output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
@@ -250,6 +274,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
+            layer_id=layer.layer_id,
         )
         return o
 

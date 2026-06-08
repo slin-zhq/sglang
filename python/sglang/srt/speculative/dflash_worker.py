@@ -1056,11 +1056,26 @@ class DFlashWorker:
         ):
             return
 
-        dark_logger.mark_attention_unavailable()
         prompt_id, block_id = dark_logger.current_prompt_and_block()
         top1_cpu = self._last_dark_top1_prob.detach().float().cpu()
         entropy_cpu = self._last_dark_entropy.detach().float().cpu()
         depth_cpu = self._last_dark_depth.detach().cpu()
+
+        # Pop attention buffer populated by torch_native_backend (if available).
+        # Buffer maps layer_id -> (attn_weights [heads, kv, kv], prefill_len).
+        attn_buf = dark_logger.pop_attn_buffer()
+        if not attn_buf:
+            dark_logger.mark_attention_unavailable()
+
+        # Use the last-layer attention (highest layer_id) for the signal.
+        last_attn = None
+        last_prefill_len = 0
+        if attn_buf:
+            last_lid = max(attn_buf.keys())
+            last_attn, last_prefill_len = attn_buf[last_lid]
+            # last_attn: [heads, kv, kv] on CPU float
+
+        import torch as _torch
 
         for b in range(top1_cpu.shape[0]):
             acc_len = (
@@ -1068,17 +1083,60 @@ class DFlashWorker:
                 if b < len(accept_length_per_req_cpu)
                 else 0
             )
-            for j in range(top1_cpu.shape[1]):
+            n_draft = top1_cpu.shape[1]
+            for j in range(n_draft):
+                # Draft position j maps to KV index (prefill_len + j).
+                if last_attn is not None:
+                    kv_j = last_prefill_len + j
+                    kv_len = last_attn.shape[-1]
+                    if kv_j < kv_len:
+                        # attn_row: [heads, kv_len] — row for draft position j
+                        attn_row = last_attn[:, kv_j, :]  # [heads, kv_len]
+                        # Mean over heads
+                        attn_mean = attn_row.mean(dim=0)  # [kv_len]
+
+                        # C_j: max attention to adjacent draft positions
+                        neighbors = []
+                        for delta in (-1, 1, -2):
+                            nb = kv_j + delta
+                            if last_prefill_len <= nb < kv_len:
+                                neighbors.append(float(attn_mean[nb].item()))
+                        C_j = max(neighbors) if neighbors else 0.0
+
+                        # attn_self_* components
+                        def _safe(idx):
+                            return float(attn_mean[idx].item()) if last_prefill_len <= idx < kv_len else 0.0
+                        attn_self_jminus1 = _safe(kv_j - 1)
+                        attn_self_jplus1  = _safe(kv_j + 1)
+                        attn_self_jminus2 = _safe(kv_j - 2)
+
+                        # D_j: entropy of attention over input (context) tokens only
+                        if last_prefill_len > 0:
+                            ctx_attn = attn_mean[:last_prefill_len].clamp(min=1e-9)
+                            ctx_attn = ctx_attn / ctx_attn.sum()
+                            D_j_raw = float(-(ctx_attn * ctx_attn.log()).sum().item())
+                            D_j = D_j_raw / max(1.0, float(_torch.tensor(last_prefill_len).float().log().item()))
+                        else:
+                            D_j = 0.0
+
+                        attn_input_max = float(attn_mean[:last_prefill_len].max().item()) if last_prefill_len > 0 else 0.0
+                    else:
+                        C_j = D_j = attn_input_max = 0.0
+                        attn_self_jminus1 = attn_self_jplus1 = attn_self_jminus2 = 0.0
+                else:
+                    C_j = D_j = attn_input_max = 0.0
+                    attn_self_jminus1 = attn_self_jplus1 = attn_self_jminus2 = 0.0
+
                 dark_logger.log_dark_row(
                     prompt_id=prompt_id,
                     block_id=block_id,
                     pos_j=j,
-                    C_j=0.0,
-                    D_j=0.0,
-                    attn_input_max=0.0,
-                    attn_self_jminus1=0.0,
-                    attn_self_jplus1=0.0,
-                    attn_self_jminus2=0.0,
+                    C_j=C_j,
+                    D_j=D_j,
+                    attn_input_max=attn_input_max,
+                    attn_self_jminus1=attn_self_jminus1,
+                    attn_self_jplus1=attn_self_jplus1,
+                    attn_self_jminus2=attn_self_jminus2,
                     depth=int(depth_cpu[b, j].item()),
                     top1_prob=float(top1_cpu[b, j].item()),
                     H_j=float(entropy_cpu[b, j].item()),

@@ -34,6 +34,12 @@ _csv_writer: Optional[csv.writer] = None
 _lock = threading.Lock()
 _warned_attention_unavailable = False
 
+# Per-cycle attention weight buffer: maps layer_id -> (attn_weights, prefill_len)
+# attn_weights shape: [num_heads, seq_len_kv, seq_len_kv] for the last sequence in the batch
+# Populated by torch_native_backend when DARK_ENABLED; cleared after each cycle.
+_attn_buffer: dict = {}
+_attn_buffer_lock = threading.Lock()
+
 
 def default_dark_csv_path() -> str:
     env_path = os.environ.get("DARK_ATTENTION_CSV", "").strip()
@@ -57,6 +63,26 @@ def init_dark_logger(path: str) -> None:
         _csv_writer = csv.writer(_csv_file)
         _csv_writer.writerow(DARK_REQUIRED_COLUMNS)
         DARK_ENABLED = True
+
+
+def store_layer_attn(layer_id: int, attn_weights, prefill_len: int) -> None:
+    """Store attention weights for a single layer call (last seq in batch).
+
+    attn_weights: [num_heads, seq_len_kv, seq_len_kv] float tensor (CPU or GPU).
+    prefill_len: number of context/prefix tokens before the draft block.
+    """
+    global ATTENTION_AVAILABLE
+    with _attn_buffer_lock:
+        _attn_buffer[layer_id] = (attn_weights, prefill_len)
+    ATTENTION_AVAILABLE = True
+
+
+def pop_attn_buffer() -> dict:
+    """Return and clear the attention buffer for the current cycle."""
+    with _attn_buffer_lock:
+        buf = dict(_attn_buffer)
+        _attn_buffer.clear()
+    return buf
 
 
 def mark_attention_unavailable() -> None:
