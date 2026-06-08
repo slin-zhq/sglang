@@ -72,6 +72,8 @@ def mark_attention_unavailable() -> None:
 
 
 def current_prompt_and_block() -> tuple[int, int]:
+    if spec_cycle_logger.ENABLED:
+        spec_cycle_logger._refresh_log_path_from_control_file()
     context = getattr(spec_cycle_logger, "_record_context", {})
     prompt_id = int(context.get("question_id", -1))
     block_id = int(getattr(spec_cycle_logger, "_current_cycle_idx", -1))

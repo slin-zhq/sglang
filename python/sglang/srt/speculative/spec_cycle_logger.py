@@ -238,6 +238,8 @@ def begin_cycle() -> int:
     Returns the cycle_idx for this cycle.
     """
     global _cycle_counter, _current_cycle_idx
+    if ENABLED:
+        _refresh_log_path_from_control_file()
     with _lock:
         idx = _cycle_counter
         _cycle_counter += 1
