@@ -71,7 +71,10 @@ TARGET_LOGITS_ENABLED: bool = os.environ.get("SPEC_TARGET_LOGITS_LOG_ENABLE", "1
 # --log-target-logits-topk in collect_data.py (sets SPEC_TARGET_LOGITS_TOPK).
 TARGET_LOGITS_TOPK: int = int(os.environ.get("SPEC_TARGET_LOGITS_TOPK", "5"))
 LOG_PATH: str = os.environ.get("SPEC_CYCLE_LOG_PATH", _DEFAULT_LOG_PATH)
-CONTROL_PATH: str = os.environ.get("SPEC_CYCLE_LOG_CONTROL_PATH", "")
+CONTROL_PATH: str = os.environ.get(
+    "SPEC_CYCLE_LOG_CONTROL_PATH",
+    os.environ.get("EAGLE_TOPK_EXP_LOG_CONTROL_PATH", ""),
+)
 
 # ──────────────────────────────────────────────
 # Thread-safe state
