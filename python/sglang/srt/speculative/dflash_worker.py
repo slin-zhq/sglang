@@ -93,10 +93,6 @@ class DFlashWorker:
         self._last_dark_depth: Optional[torch.Tensor] = None
         if self._write_dark_attention:
             dark_logger.init_dark_logger(server_args.dark_attention_csv)
-        print(
-            f"[DARK_DEBUG] log_dark_attention={getattr(server_args, 'log_dark_attention', 'ATTR_MISSING')}",
-            flush=True,
-        )
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
