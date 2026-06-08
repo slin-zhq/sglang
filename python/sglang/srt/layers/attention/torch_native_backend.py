@@ -64,7 +64,12 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         if extend_seq_lens is None:
-            extend_seq_lens = seq_lens - extend_prefix_lens
+            # query shape before movedim: [total_query_tokens, num_heads, head_size]
+            # derive per-sequence extend lengths from the actual query token count
+            total_q_tokens = query.shape[0]
+            n_seqs = seq_lens.shape[0]
+            per_seq = total_q_tokens // n_seqs
+            extend_seq_lens = seq_lens.new_full((n_seqs,), per_seq)
         else:
             assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
