@@ -63,7 +63,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             extend_prefix_lens = torch.zeros_like(seq_lens)
         else:
             assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
-        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+        if extend_seq_lens is None:
+            extend_seq_lens = seq_lens - extend_prefix_lens
+        else:
+            assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
