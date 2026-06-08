@@ -27,9 +27,10 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
 )
+from sglang.srt.speculative import dark_logger
+from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.speculative import spec_cycle_logger as _logger
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,14 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self.log_dark_attention = bool(server_args.log_dark_attention)
+        self._write_dark_attention = self.log_dark_attention and tp_rank == 0
+        self._warned_dark_marginals_unavailable = False
+        self._last_dark_top1_prob: Optional[torch.Tensor] = None
+        self._last_dark_entropy: Optional[torch.Tensor] = None
+        self._last_dark_depth: Optional[torch.Tensor] = None
+        if self._write_dark_attention:
+            dark_logger.init_dark_logger(server_args.dark_attention_csv)
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -349,6 +358,8 @@ class DFlashWorker:
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
+        if self._write_dark_attention:
+            dark_logger.close_dark_logger()
         pass
 
     def _gather_req_to_token_masked(
@@ -669,6 +680,16 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        if self.log_dark_attention:
+            (
+                self._last_dark_top1_prob,
+                self._last_dark_entropy,
+            ) = self._compute_dflash_dark_marginals(
+                hidden_states=draft_hidden[:, 1:, :],
+                lm_head=lm_head,
+                bs=bs,
+            )
+            self._last_dark_depth = self._dflash_dark_depths(bs)
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
@@ -873,6 +894,196 @@ class DFlashWorker:
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
         return out_token_ids
+
+    def _empty_dflash_dark_stats(
+        self, bs: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        draft_count = max(int(self.block_size) - 1, 0)
+        shape = (int(bs), draft_count)
+        return (
+            torch.zeros(shape, dtype=torch.float32, device=device),
+            torch.zeros(shape, dtype=torch.float32, device=device),
+        )
+
+    def _warn_dark_marginals_unavailable(self, reason: Exception) -> None:
+        if self._warned_dark_marginals_unavailable:
+            return
+        self._warned_dark_marginals_unavailable = True
+        if self.tp_rank == 0:
+            logger.warning(
+                "DARK: DFLASH draft marginals unavailable; top1_prob/H_j logged as zeros. reason=%s",
+                reason,
+            )
+
+    def _compute_dflash_dark_marginals(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        bs: int,
+        chunk_size: int = 64,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute top-1 probability and entropy for DFlash draft positions."""
+        try:
+            top1_prob, entropy = self._empty_dflash_dark_stats(
+                bs, hidden_states.device
+            )
+            draft_count = top1_prob.shape[1]
+            if draft_count <= 0 or hidden_states.numel() == 0:
+                return top1_prob, entropy
+
+            if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+                raise RuntimeError(
+                    "lm_head missing vocab-parallel weight/shard_indices"
+                )
+
+            shard = lm_head.shard_indices
+            weight = lm_head.weight
+            weight_dtype = weight.dtype
+            num_org = int(shard.num_org_elements)
+            num_org_padded = int(shard.num_org_elements_padded)
+            num_added = int(shard.num_added_elements)
+
+            flat_hidden = hidden_states.reshape(bs * draft_count, -1)
+            top1_flat = top1_prob.reshape(-1)
+            entropy_flat = entropy.reshape(-1)
+            tp_group = get_tp_group()
+            tp_size = int(tp_group.world_size)
+
+            for start in range(0, flat_hidden.shape[0], int(chunk_size)):
+                end = min(int(flat_hidden.shape[0]), start + int(chunk_size))
+                hs = flat_hidden[start:end]
+                if hs.dtype != weight_dtype:
+                    hs = hs.to(weight_dtype)
+                chunk_len = int(hs.shape[0])
+
+                logits_parts = []
+                if num_org > 0:
+                    logits_parts.append(torch.matmul(hs, weight[:num_org].T).float())
+                if num_added > 0:
+                    added_slice_start = num_org_padded
+                    added_slice_end = num_org_padded + num_added
+                    logits_parts.append(
+                        torch.matmul(
+                            hs, weight[added_slice_start:added_slice_end].T
+                        ).float()
+                    )
+
+                if logits_parts:
+                    local_logits = (
+                        torch.cat(logits_parts, dim=-1)
+                        if len(logits_parts) > 1
+                        else logits_parts[0]
+                    )
+                    local_max = torch.max(local_logits, dim=-1).values
+                else:
+                    local_logits = None
+                    local_max = torch.full(
+                        (chunk_len,),
+                        -float("inf"),
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+
+                global_max = local_max.clone()
+                if tp_size > 1:
+                    torch.distributed.all_reduce(
+                        global_max,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=tp_group.device_group,
+                    )
+
+                if local_logits is None:
+                    local_sum_exp = torch.zeros_like(global_max)
+                    local_weighted_sum = torch.zeros_like(global_max)
+                else:
+                    shifted_exp = torch.exp(local_logits - global_max.unsqueeze(1))
+                    local_sum_exp = shifted_exp.sum(dim=-1)
+                    local_weighted_sum = (shifted_exp * local_logits).sum(dim=-1)
+
+                global_sum_exp = local_sum_exp.clone()
+                global_weighted_sum = local_weighted_sum.clone()
+                if tp_size > 1:
+                    torch.distributed.all_reduce(
+                        global_sum_exp,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=tp_group.device_group,
+                    )
+                    torch.distributed.all_reduce(
+                        global_weighted_sum,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=tp_group.device_group,
+                    )
+
+                valid = global_sum_exp > 0
+                if valid.any():
+                    safe_sum_exp = global_sum_exp.clamp_min(1e-20)
+                    log_z = global_max + safe_sum_exp.log()
+                    top1_flat[start:end] = torch.where(
+                        valid,
+                        torch.exp(global_max - log_z),
+                        torch.zeros_like(global_max),
+                    )
+                    entropy_flat[start:end] = torch.where(
+                        valid,
+                        log_z - global_weighted_sum / safe_sum_exp,
+                        torch.zeros_like(global_max),
+                    )
+
+            return top1_prob, entropy
+        except Exception as e:
+            self._warn_dark_marginals_unavailable(e)
+            return self._empty_dflash_dark_stats(bs, hidden_states.device)
+
+    def _dflash_dark_depths(self, bs: int) -> torch.Tensor:
+        draft_count = max(int(self.block_size) - 1, 0)
+        if draft_count <= 0:
+            return torch.empty((int(bs), 0), dtype=torch.int64, device=self.device)
+        return torch.arange(draft_count, dtype=torch.int64, device=self.device)[
+            None, :
+        ].expand(int(bs), -1)
+
+    def _log_dark_attention_rows(
+        self,
+        accept_length_per_req_cpu: list[int],
+    ) -> None:
+        if not dark_logger.DARK_ENABLED:
+            return
+        if (
+            self._last_dark_top1_prob is None
+            or self._last_dark_entropy is None
+            or self._last_dark_depth is None
+        ):
+            return
+
+        dark_logger.mark_attention_unavailable()
+        prompt_id, block_id = dark_logger.current_prompt_and_block()
+        top1_cpu = self._last_dark_top1_prob.detach().float().cpu()
+        entropy_cpu = self._last_dark_entropy.detach().float().cpu()
+        depth_cpu = self._last_dark_depth.detach().cpu()
+
+        for b in range(top1_cpu.shape[0]):
+            acc_len = (
+                int(accept_length_per_req_cpu[b])
+                if b < len(accept_length_per_req_cpu)
+                else 0
+            )
+            for j in range(top1_cpu.shape[1]):
+                dark_logger.log_dark_row(
+                    prompt_id=prompt_id,
+                    block_id=block_id,
+                    pos_j=j,
+                    C_j=0.0,
+                    D_j=0.0,
+                    attn_input_max=0.0,
+                    attn_self_jminus1=0.0,
+                    attn_self_jplus1=0.0,
+                    attn_self_jminus2=0.0,
+                    depth=int(depth_cpu[b, j].item()),
+                    top1_prob=float(top1_cpu[b, j].item()),
+                    H_j=float(entropy_cpu[b, j].item()),
+                    accept_j=1 if j < acc_len else 0,
+                )
 
     def _append_target_hidden_to_draft_kv(
         self,
@@ -1230,6 +1441,8 @@ class DFlashWorker:
             page_size=self.page_size,
         )
         _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
+        if dark_logger.DARK_ENABLED:
+            self._log_dark_attention_rows(accept_length_per_req_cpu)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
