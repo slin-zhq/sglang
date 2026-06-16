@@ -1072,13 +1072,20 @@ class DFlashWorker:
                 "DARK delta_j shape mismatch: "
                 f"top1={tuple(top1_cpu.shape)} h_draft={tuple(h_draft.shape)}"
             )
-        if h_target_full.numel() != bsz * self.block_size * hdim:
+        if h_target_full.shape[0] != bsz * self.block_size:
             raise RuntimeError(
                 "DARK delta_j target hidden shape mismatch: "
-                f"h_target={tuple(h_target_full.shape)} expected_flat="
-                f"{bsz * self.block_size * hdim}"
+                f"h_target={tuple(h_target_full.shape)} expected_tokens="
+                f"{bsz * self.block_size}"
             )
-        h_target = h_target_full.view(bsz, self.block_size, hdim)[:, 1:, :]
+        h_target_projected = self.draft_model.project_target_hidden(h_target_full)
+        if h_target_projected.shape[-1] != hdim:
+            raise RuntimeError(
+                "DARK delta_j projected target hidden dim mismatch: "
+                f"h_target_projected={tuple(h_target_projected.shape)} "
+                f"h_draft={tuple(h_draft.shape)}"
+            )
+        h_target = h_target_projected.view(bsz, self.block_size, hdim)[:, 1:, :]
         diff = h_target - h_draft
         delta_raw = diff.norm(dim=-1).float().cpu()
         t_norm = h_target.norm(dim=-1).clamp_min(1e-9)
