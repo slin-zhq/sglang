@@ -24,6 +24,8 @@ DARK_REQUIRED_COLUMNS = [
     "top1_prob",
     "H_j",
     "accept_j",
+    "delta_j_raw",
+    "delta_j_cos",
 ]
 
 DARK_ENABLED = False
@@ -120,6 +122,8 @@ def log_dark_row(
     top1_prob,
     H_j,
     accept_j,
+    delta_j_raw=0.0,
+    delta_j_cos=0.0,
 ) -> None:
     if not DARK_ENABLED:
         return
@@ -143,6 +147,8 @@ def log_dark_row(
                 float(top1_prob),
                 float(H_j),
                 int(accept_j),
+                float(delta_j_raw),
+                float(delta_j_cos),
             ]
         )
 

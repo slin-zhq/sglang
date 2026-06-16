@@ -704,6 +704,8 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
+        if self.log_dark_attention:
+            verify_input.dark_h_draft = draft_hidden[:, 1:, :].detach().clone()
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
@@ -1046,6 +1048,8 @@ class DFlashWorker:
     def _log_dark_attention_rows(
         self,
         accept_length_per_req_cpu: list[int],
+        h_target_full: Optional[torch.Tensor],
+        h_draft: Optional[torch.Tensor],
     ) -> None:
         if not dark_logger.DARK_ENABLED:
             return
@@ -1055,11 +1059,32 @@ class DFlashWorker:
             or self._last_dark_depth is None
         ):
             return
+        if h_target_full is None or h_draft is None:
+            raise RuntimeError("DARK delta_j logging requires target and draft hiddens.")
 
         prompt_id, block_id = dark_logger.current_prompt_and_block()
         top1_cpu = self._last_dark_top1_prob.detach().float().cpu()
         entropy_cpu = self._last_dark_entropy.detach().float().cpu()
         depth_cpu = self._last_dark_depth.detach().cpu()
+        bsz, draft_count, hdim = h_draft.shape
+        if top1_cpu.shape != (bsz, draft_count):
+            raise RuntimeError(
+                "DARK delta_j shape mismatch: "
+                f"top1={tuple(top1_cpu.shape)} h_draft={tuple(h_draft.shape)}"
+            )
+        if h_target_full.numel() != bsz * self.block_size * hdim:
+            raise RuntimeError(
+                "DARK delta_j target hidden shape mismatch: "
+                f"h_target={tuple(h_target_full.shape)} expected_flat="
+                f"{bsz * self.block_size * hdim}"
+            )
+        h_target = h_target_full.view(bsz, self.block_size, hdim)[:, 1:, :]
+        diff = h_target - h_draft
+        delta_raw = diff.norm(dim=-1).float().cpu()
+        t_norm = h_target.norm(dim=-1).clamp_min(1e-9)
+        d_norm = h_draft.norm(dim=-1).clamp_min(1e-9)
+        cos_sim = (h_target * h_draft).sum(dim=-1) / (t_norm * d_norm)
+        delta_cos = (1.0 - cos_sim).float().cpu()
 
         # Pop attention buffer populated by torch_native_backend (if available).
         # Buffer maps layer_id -> (attn_weights [heads, kv, kv], prefill_len).
@@ -1141,6 +1166,8 @@ class DFlashWorker:
                     top1_prob=float(top1_cpu[b, j].item()),
                     H_j=float(entropy_cpu[b, j].item()),
                     accept_j=1 if j < acc_len else 0,
+                    delta_j_raw=float(delta_raw[b, j].item()),
+                    delta_j_cos=float(delta_cos[b, j].item()),
                 )
 
     def _append_target_hidden_to_draft_kv(
@@ -1487,6 +1514,11 @@ class DFlashWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        dark_h_target_full = (
+            logits_output.hidden_states.detach()
+            if dark_logger.DARK_ENABLED and logits_output.hidden_states is not None
+            else None
+        )
 
         (
             new_verified_id,
@@ -1500,7 +1532,11 @@ class DFlashWorker:
         )
         _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
         if dark_logger.DARK_ENABLED:
-            self._log_dark_attention_rows(accept_length_per_req_cpu)
+            self._log_dark_attention_rows(
+                accept_length_per_req_cpu,
+                dark_h_target_full,
+                verify_input.dark_h_draft,
+            )
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(

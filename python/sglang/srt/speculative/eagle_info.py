@@ -79,6 +79,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     dark_top1_prob: Optional[torch.Tensor] = None
     dark_entropy: Optional[torch.Tensor] = None
     dark_depth: Optional[torch.Tensor] = None
+    dark_h_draft: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1

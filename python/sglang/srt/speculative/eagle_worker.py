@@ -389,7 +389,7 @@ class EAGLEWorker(TpModelWorker):
             _t_verify_end = _logger._sync_and_time() if _logger.ENABLED else 0.0
 
             if self.log_dark_attention:
-                self._log_dark_attention_rows(spec_info, verify_output)
+                self._log_dark_attention_rows(spec_info, verify_output, logits_output)
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -916,6 +916,7 @@ class EAGLEWorker(TpModelWorker):
         self,
         spec_info: EagleVerifyInput,
         verify_output: EagleVerifyOutput,
+        logits_output: LogitsProcessorOutput,
     ) -> None:
         if (
             spec_info.dark_top1_prob is None
@@ -929,6 +930,30 @@ class EAGLEWorker(TpModelWorker):
         top1_cpu = spec_info.dark_top1_prob.detach().float().cpu()
         entropy_cpu = spec_info.dark_entropy.detach().float().cpu()
         depth_cpu = spec_info.dark_depth.detach().cpu()
+        h_draft = spec_info.dark_h_draft
+        h_target_flat = logits_output.hidden_states
+        if h_draft is None or h_target_flat is None:
+            raise RuntimeError("DARK delta_j logging requires target and draft hiddens.")
+
+        bsz, draft_count, hdim = h_draft.shape
+        if top1_cpu.shape != (bsz, draft_count):
+            raise RuntimeError(
+                "DARK delta_j shape mismatch: "
+                f"top1={tuple(top1_cpu.shape)} h_draft={tuple(h_draft.shape)}"
+            )
+        if h_target_flat.numel() != bsz * draft_count * hdim:
+            raise RuntimeError(
+                "DARK delta_j target hidden shape mismatch: "
+                f"h_target={tuple(h_target_flat.shape)} expected_flat="
+                f"{bsz * draft_count * hdim}"
+            )
+        h_target = h_target_flat.detach().view(bsz, draft_count, hdim)
+        diff = h_target - h_draft
+        delta_raw = diff.norm(dim=-1).float().cpu()
+        t_norm = h_target.norm(dim=-1).clamp_min(1e-9)
+        d_norm = h_draft.norm(dim=-1).clamp_min(1e-9)
+        cos_sim = (h_target * h_draft).sum(dim=-1) / (t_norm * d_norm)
+        delta_cos = (1.0 - cos_sim).float().cpu()
 
         draft_count = top1_cpu.shape[1]
         accepted_by_batch = [set() for _ in range(top1_cpu.shape[0])]
@@ -956,6 +981,8 @@ class EAGLEWorker(TpModelWorker):
                     top1_prob=float(top1_cpu[b, j].item()),
                     H_j=float(entropy_cpu[b, j].item()),
                     accept_j=1 if j in accepted else 0,
+                    delta_j_raw=float(delta_raw[b, j].item()),
+                    delta_j_cos=float(delta_cos[b, j].item()),
                 )
 
     def clear_cache_pool(self):
